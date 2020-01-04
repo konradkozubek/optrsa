@@ -1,0 +1,4 @@
+# Python virtual environment
+virtualenv/
+# JetBrains PyCharm files
+.idea/
