@@ -1,4 +1,17 @@
 # Python virtual environment
 virtualenv/
+# Executables directory
+exec/
+# Inputs directory
+input/
+# cma package output
+outcmaes/
+# rsa3d program output
+outrsa/
+packing*
+# Data dictionary (for example created during the test of cma package)
+_CMAESDataLogger_datadict.py
 # JetBrains PyCharm files
 .idea/
+# MacOS
+.DS_Store
