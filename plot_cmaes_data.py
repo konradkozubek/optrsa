@@ -6,7 +6,9 @@ import matplotlib
 if sys.platform.startswith('darwin'): # MacOS
     matplotlib.use('MacOSX')
 else:
-    matplotlib.use("Qt5Agg") # Not tested, may need additional dependencies. See https://matplotlib.org/tutorials/introductory/usage.html#backends
+    # Not tested, may need additional dependencies.
+    # See https://matplotlib.org/tutorials/introductory/usage.html#backends
+    matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 
 if __name__ == '__main__':
