@@ -24,14 +24,17 @@ import glob
 import shutil
 import timeit
 import subprocess
+import multiprocessing.pool
 import datetime
 import pickle
+from wolframclient.evaluation import WolframLanguageSession
+from wolframclient.language import wl
 
 
 # Get absolute path to optrsa project directory
 _proj_dir = os.path.dirname(__file__)
-# Absolute path to python interpreter, assuming that relative path reads /virtualenv/bin/python
-_python_path = _proj_dir + "/virtualenv/bin/python"  # Or: os.path.abspath("virtualenv/bin/python")
+# Absolute path to python interpreter, assuming that relative path reads /optrsa-py-3-8-1-venv/bin/python
+_python_path = _proj_dir + "/optrsa-py-3-8-1-venv/bin/python"  # Or: os.path.abspath("optrsa-py-3-8-1-venv/bin/python")
 # Absolute path to Wolfram Kernel script, assuming that relative path reads /exec/wolframscript
 _wolfram_path = _proj_dir + "/exec/wolframscript"
 # Absolute path to rsa3d executable compiled with target 2.1, assuming that relative path reads /exec/rsa.2.1
@@ -114,13 +117,16 @@ def wolfram_polydisk_area(arg: np.ndarray) -> float:
     wolfram_disks_str = "{" + ",".join(wolfram_disks_list) + "}"
     # TODO Check, if the Wolfram Kernel script can be called with shell=False and whether the performance will be better
     area_str = subprocess.check_output(_wolfram_path
-                                       + " -code 'Area[Region[Apply[RegionUnion,{}]]]'".format(wolfram_disks_str),
+                                       + " -code 'N[Area[Region[Apply[RegionUnion,{}]]]]'".format(wolfram_disks_str),
                                        stderr=subprocess.STDOUT, shell=True)
     return float(area_str)
 
 
 class RSACMAESOptimization(metaclass=abc.ABCMeta):
-    """Abstract base class for performing optimization of RSA packing fraction and managing the output data"""
+    """
+    Abstract base class for performing optimization of RSA packing fraction with CMA-ES optimizer
+    and managing the output data
+    """
 
     # TODO Maybe treat cma_options in the same way as rsa_parameters (default values dictionary, input files)
     default_rsa_parameters: dict = {}
@@ -141,6 +147,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  parallel: bool = True,
                  input_rel_path: str = None,
                  output_to_file: bool = True,
+                 show_graph: bool = False,
                  signature_suffix: str = None) -> None:
 
         self.initial_mean = initial_mean
@@ -151,6 +158,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.accuracy = accuracy
         self.parallel = parallel
         self.output_to_file = output_to_file
+        self.show_graph = show_graph
 
         # Set optimization signature
         self.signature = datetime.datetime.now().isoformat(timespec="milliseconds")  # Default timezone is right
@@ -196,13 +204,13 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                  for param_name, param_value in self.all_rsa_parameters.items()])
 
         # Create file containing output of the rsa3d accuracy mode in output directory
-        self.output_filename = self.output_dir + "/packing_fraction_vs_params.txt"
+        self.output_filename = self.output_dir + "/packing-fraction-vs-params.txt"
         # Create a file if it does not exist
         with open(self.output_filename, "w+"):  # as output_file
             pass
 
-        # Create lists of arguments (constant during the whole optimization)
-        # for running rsa3d program in other process, two lists for beginning and end
+        # Create list of common arguments (constant during the whole optimization)
+        # for running rsa3d program in other process
         self.rsa_proc_arguments = [_rsa_path, "accuracy"]
         if self.input_given:
             # Correct results, but problems with running rsa3d with other command afterwards,
@@ -214,23 +222,62 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         else:
             self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
                                             for param_name, param_value in self.all_rsa_parameters.items()])
-        # TODO Add a possibility to pass additional information to rsa3d program's accuracy mode, add this information
-        #  in rsa_simulation_* methods
         # Index at which particleAttributes parameter will be inserted
         self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
         self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
 
-        # TODO Maybe move these definitions to run method (then CMAES initialization information will be added to output
-        #  file. Then change here self.CMAES initialization to self.CMAES = None.
+        # TODO Maybe move these definitions to run method (then redirecting output will be done only in run method and
+        #  CMAES initialization information will be added to output file).
+        #  Then change here self.CMAES initialization to self.CMAES = None.
+        #  In run method, before self.CMAES assignement add printing optimization signature, and after optimization add
+        #  printing current time (maybe also the optimization time).
         # Counter of conducted simulations
         self.simulations_num = 0
         # Counter of phenotype candidates in generation
         self.candidate_num = 0
+        # Redirect output - done here to catch CMAES initialization information. To be moved to run method together
+        # with CMAES initialization
+        if self.output_to_file:
+            self.stdout = sys.stdout
+            self.stderr = sys.stderr
+            # If a decorator for redirecting output were used, a "with" statement could have been used
+            # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
+            # output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
+            output_file = open(self.output_dir + "/optimization-output.txt", "w+")
+            sys.stdout = output_file
+            sys.stderr = output_file
+            # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
         # Create CMA evolution strategy optimizer object
         # TODO Maybe add serving input files and default values for CMA-ES options (currently directly self.cma_options)
         self.CMAES = cma.CMAEvolutionStrategy(self.initial_mean, self.initial_stddevs,
                                               inopts=self.cma_options)
         self.CMAES.logger.name_prefix += self.signature + "/"  # Default name_prefix is outcmaes/
+
+        # Settings for parallel computation
+        # TODO Test if it works in all cases
+        # TODO Maybe add ompThreads to common self.rsa_parameters if it will not be changed
+        # TODO multiprocessing.cpu_count() instead? (Usage on server)
+        self.parallel_threads_number = os.cpu_count()  # * 2
+        self.parallel_simulations_number = min(self.parallel_threads_number, self.CMAES.popsize)
+        self.omp_threads = self.parallel_threads_number // self.CMAES.popsize\
+            if self.parallel and self.parallel_threads_number > self.CMAES.popsize else 1
+
+    def __getstate__(self):
+        """
+        Method modifying pickling behaviour of the class' instance.
+        See https://docs.python.org/3/library/pickle.html#handling-stateful-objects.
+        It needs to be overridden by a child class if it defines another unpicklable attributes.
+        """
+
+        # Copy the object's state from self.__dict__ which contains all instance attributes using the dict.copy()
+        # method to avoid modifying the original state
+        state = self.__dict__.copy()
+        # Remove the unpicklable entries
+        unpicklable_attributes = ["stdout", "stderr"]
+        for attr in unpicklable_attributes:
+            if attr in state:
+                del state[attr]
+        return state
 
     @abc.abstractmethod
     def arg_to_particle_attributes(self, arg: np.ndarray) -> str:
@@ -240,9 +287,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     # TODO Maybe rename this function (to rsa_simulation_serial) and make the second (rsa_simulation_parallel),
     #  and in current function use nested "with" statements for closing process and file objects after waiting for
     #  the process and return nothing.
-    #  Maybe create other functions for reading mean packing fractions from packing_fraction_vs_params.txt file for both
+    #  Maybe create other functions for reading mean packing fractions from packing-fraction-vs-params.txt file for both
     #  serial and parallel computing cases.
-    def rsa_simulation(self, arg: np.ndarray) -> Tuple[io.TextIOBase, subprocess.Popen]:
+    def get_rsa_simulation_process(self, arg: np.ndarray) -> Tuple[io.TextIOBase, subprocess.Popen]:
         """
         Function running simulations for particle shape specified by arg and returning rsa3d output file
         and rsa3d process
@@ -256,27 +303,25 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-particleAttributes=" + particle_attributes)
         # TODO Maybe add setting ompThreads option in case of parallel computation (otherwise specify it explicitly),
         #  maybe calculate ompThreads based on self.CMAES.popsize and number of CPU cores obtained using
-        #  multiprocessing module
-        simulation_labels = ",".join([str(self.simulations_num), str(self.CMAES.countiter), str(self.candidate_num)])
-        # Earlier: str(self.simulations_num), str(self.CMAES.countevals), ... - self.CMAES.countevals value is updated
-        # of course only after the end of each generation.
+        #  multiprocessing module - DONE in rsa_simulation method
+        simulation_labels = ",".join([str(self.CMAES.countiter), str(self.candidate_num), str(self.simulations_num)])
         rsa_proc_arguments.append(simulation_labels)
         self.simulations_num += 1
         # TODO In case of reevaluation (UH-CMA-ES), simulation_labels will have to identify the evaluation correctly
         #  (self.simulations_num should be fine to ensure distinction)
         # Create subdirectory for output of rsa3d program in this simulation.
-        # simulation_labels may contain evaluation number, generation number and candidate number.
+        # simulation_labels contain generation number, candidate number and evaluation number.
         simulation_output_dir = self.output_dir + "/" + simulation_labels.replace(",", "_")
         if not os.path.exists(simulation_output_dir):
             os.makedirs(simulation_output_dir)
         # Maybe use shutil instead
         # Create a file for saving the output of rsa3d program
-        # TODO Decide if a simpler name, as "rsa-output.txt", would be sufficient
-        rsa_output_filename = simulation_output_dir + "/packing_" + particle_attributes.replace(" ", "_")
-        # surfaceVolume parameter is not appended to filename if it is given in input file
-        if not self.input_given:
-            rsa_output_filename += "_" + str(self.all_rsa_parameters["surfaceVolume"])
-        rsa_output_filename += "_output.txt"
+        # rsa_output_filename = simulation_output_dir + "/packing_" + particle_attributes.replace(" ", "_")
+        # # surfaceVolume parameter is not appended to filename if it is given in input file
+        # if not self.input_given:
+        #     rsa_output_filename += "_" + str(self.all_rsa_parameters["surfaceVolume"])
+        # rsa_output_filename += "_output.txt"
+        rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
 
         # # Serial computing case
         # with open(rsa_output_filename, "w+") as rsa_output_file:
@@ -301,7 +346,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             print("\nGeneration no. {}, candidate no. {}".format(self.CMAES.countiter, self.candidate_num))
 
             # Run simulation
-            rsa_output_file, rsa_process = self.rsa_simulation(pheno_candidate)
+            rsa_output_file, rsa_process = self.get_rsa_simulation_process(pheno_candidate)
             rsa_process.wait()
             rsa_output_file.close()
             # TODO Check, if in this solution (without "with" statement) process ends properly
@@ -341,7 +386,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # TODO Maybe implement repeating these loops if population size is bigger than for example
         #  (number of CPU cores) * 2.
         for pheno_candidate in pheno_candidates:
-            rsa_processes_and_outputs.append(self.rsa_simulation(pheno_candidate))
+            rsa_processes_and_outputs.append(self.get_rsa_simulation_process(pheno_candidate))
             self.candidate_num += 1
         # TODO Check if using EvalParallel from cma package or multiprocessing (e.g. Pool) together with Popen
         #  makes sense
@@ -352,14 +397,115 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                                                  self.candidate_num))
         with open(self.output_filename, "rb") as rsa_output_file:
             # TODO Maybe find more efficient or elegant solution
+            # TODO Maybe iterate through lines in file in reversed order - results of the current generation should be
+            #  at the end
             for line in rsa_output_file:
                 # Does the line need to be decoded (line_str = line.decode())?
                 evaluation_data = line.split(b"\t")
                 evaluation_labels = evaluation_data[0].split(b",")
-                if int(evaluation_labels[2]) == self.CMAES.countiter:
-                    candidate_num = int(evaluation_labels[3])
+                if int(evaluation_labels[0]) == self.CMAES.countiter:
+                    candidate_num = int(evaluation_labels[1])
                     mean_packing_fraction = float(evaluation_data[1])
                     values[candidate_num] = -mean_packing_fraction
+        return values.tolist()  # or list(values), because values.ndim == 1
+
+    def rsa_simulation(self, candidate_num: int, arg: np.ndarray) -> None:
+        """
+        Function running simulations for particle shape specified by arg and waiting for rsa3d process.
+        It assigns proper number of OpenMP threads to the rsa3d evaluation.
+        """
+
+        # Run a process with rsa3d program running simulation
+        rsa_proc_arguments = self.rsa_proc_arguments[:]  # Copy the values of the template arguments
+        particle_attributes = self.arg_to_particle_attributes(arg)
+        rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-particleAttributes=" + particle_attributes)
+        # TODO Maybe move part of this code to constructor
+        omp_threads_attribute = str(self.omp_threads)
+        if self.parallel and self.parallel_threads_number > self.CMAES.popsize\
+                and candidate_num >= self.CMAES.popsize * (self.omp_threads + 1) - self.parallel_threads_number:
+            omp_threads_attribute = str(self.omp_threads + 1)
+        rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-ompThreads=" + omp_threads_attribute)
+        simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num), str(self.simulations_num)])
+        # Earlier: str(self.simulations_num), str(self.CMAES.countevals), str(self.CMAES.countiter), str(candidate_num)
+        # - self.CMAES.countevals value is updated of course only after the end of each generation.
+        # self.simulations_num is the number ordering the beginning of simulation, the position of data in
+        # packing-fraction-vs-params.txt corresponds to ordering of the end of simulation, and from generation number
+        # (self.CMAES.countiter), population size and candidate number one can calculate the number of evaluation
+        # mentioned in self.CMAES optimizer e.g. in the result (number of evaluation for the best solution)
+        rsa_proc_arguments.append(simulation_labels)
+        self.simulations_num += 1
+        # TODO In case of reevaluation (UH-CMA-ES), simulation_labels will have to identify the evaluation correctly
+        #  (self.simulations_num should be fine to ensure distinction)
+        # Create subdirectory for output of rsa3d program in this simulation.
+        # simulation_labels contain generation number, candidate number and evaluation number.
+        simulation_output_dir = self.output_dir + "/" + simulation_labels.replace(",", "_")
+        if not os.path.exists(simulation_output_dir):
+            os.makedirs(simulation_output_dir)
+            # Maybe use shutil instead
+        # Create rsa3d input file containing simulation-specific parameters in simulation output directory
+        with open(simulation_output_dir + "/rsa-simulation-input.txt", "w+") as rsa_input_file:
+            rsa_input_file.write("ompThreads = {}\n".format(omp_threads_attribute))
+            rsa_input_file.write("particleAttributes = {}\n".format(particle_attributes))
+        # TODO Maybe problem with wolfram processes will vanish when using two input files (improbable)
+        # Create a file for saving the output of rsa3d program
+        # rsa_output_filename = simulation_output_dir + "/packing_" + particle_attributes.replace(" ", "_")
+        # # surfaceVolume parameter is not appended to filename if it is given in input file
+        # if not self.input_given:
+        #     rsa_output_filename += "_" + str(self.all_rsa_parameters["surfaceVolume"])
+        # rsa_output_filename += "_output.txt"
+        rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
+
+        print("RSA simulation start: generation no. {}, candidate no. {}, simulation no. {}\nArgument: {}\n"
+              "particleAttributes: {}".format(*simulation_labels.split(","), arg, particle_attributes))
+        # TODO To be removed - for debugging
+        # print("RSA simulation process call: {}\n".format(" ".join(rsa_proc_arguments)))
+        with open(rsa_output_filename, "w+") as rsa_output_file:
+            # Open a process with simulation
+            with subprocess.Popen(rsa_proc_arguments,
+                                  stdout=rsa_output_file,
+                                  stderr=rsa_output_file,
+                                  cwd=simulation_output_dir) as rsa_process:
+                rsa_process.wait()
+        print("RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}".format(
+            *simulation_labels.split(",")))
+
+    def evaluate_generation_parallel_in_pool(self, pheno_candidates: List[np.ndarray]) -> List[float]:
+        """
+        Method running rsa simulations for all phenotype candidates in generation.
+        It evaluates self.run_simulation method for proper number of candidates in parallel.
+        It uses multiprocessing.pool.ThreadPool for managing a pool of workers.
+        concurrent.futures.ThreadPoolExecutor is an alternative with poorer API.
+        :param pheno_candidates: List of NumPy ndarrays containing phenotype candidates in generation
+        :return: List of fitness function values (minus mean packing fraction) for respective phenotype candidates
+        """
+        values = np.zeros(len(pheno_candidates), dtype=np.float)
+        # It is said that multiprocessing module does not work with class instance method calls,
+        # but in this case multiprocessing.pool.ThreadPool seems to work fine with the run_simulation method.
+        with multiprocessing.pool.ThreadPool(processes=self.parallel_simulations_number) as pool:
+            pool.starmap(self.rsa_simulation, list(enumerate(pheno_candidates)))
+            # Maybe read the last packing fraction value after waiting for simulation process in
+            # rsa_simulation method and check if the simulation labels are correct (which means that rsa3d program
+            # successfully wrote the last line)
+            # TODO Maybe add (it works - probably it doesn't need closing the pool):
+            # pool.close()
+            # pool.join()
+        # TODO Consider returning status from Popen objects (if it is possible) and getting them from pool.map and
+        #  checking, if rsa simulations finished correctly
+
+        with open(self.output_filename, "rb") as rsa_output_file:
+            # TODO Maybe find more efficient or elegant solution
+            # TODO Maybe iterate through lines in file in reversed order - results of the current generation should be
+            #  at the end
+            for line in rsa_output_file:
+                # Does the line need to be decoded (line_str = line.decode())?
+                evaluation_data = line.split(b"\t")
+                evaluation_labels = evaluation_data[0].split(b",")
+                if int(evaluation_labels[0]) == self.CMAES.countiter:
+                    candidate_num = int(evaluation_labels[1])
+                    mean_packing_fraction = float(evaluation_data[1])
+                    values[candidate_num] = -mean_packing_fraction
+        # TODO Add checking if there exists a zero value in values list and deal with the error (in such a case
+        #  record for corresponding candidate wasn't found in packing-fraction-vs-params.txt file)
         return values.tolist()  # or list(values), because values.ndim == 1
 
     # TODO Create this decorator properly - probably in an inner class or create a parameterized decorator outside the
@@ -401,15 +547,16 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #  module. See: https://stackoverflow.com/questions/14906764/how-to-redirect-stdout-to-both-file-and
         #  -console-with-scripting
         # TODO Other option - use the first solution from the above link
-        if self.output_to_file:
-            stdout = sys.stdout
-            stderr = sys.stderr
-            # If a decorator for redirecting output were used, a "with" statement could have been used
-            # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
-            output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
-            sys.stdout = output_file
-            sys.stderr = output_file
-            # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
+        # if self.output_to_file:
+        #     stdout = sys.stdout
+        #     stderr = sys.stderr
+        #     # If a decorator for redirecting output were used, a "with" statement could have been used
+        #     # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
+        #     # output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
+        #     output_file = open(self.output_dir + "/optimization-output.txt", "w+")
+        #     sys.stdout = output_file
+        #     sys.stderr = output_file
+        #     # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
 
         while not self.CMAES.stop():
             print("Generation number {}".format(self.CMAES.countiter))
@@ -419,12 +566,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             #  (plotting using matplotlib)
             print("Phenotype candidates:")
             print(pheno_candidates)
-            values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
+            # values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
+            #     else self.evaluate_generation_serial(pheno_candidates)
+            values = self.evaluate_generation_parallel_in_pool(pheno_candidates) if self.parallel\
                 else self.evaluate_generation_serial(pheno_candidates)
             # TODO Check, what happens in case when e.g. None is returned as candidate value, so (I guess)
             #  a reevaluation is conducted
             # TODO Maybe add checking if rsa simulation finished with success and successfully wrote a line to
-            #  packing_fraction_vs_params.txt file. If it fails, in serial computing the previous packing fraction
+            #  packing-fraction-vs-params.txt file. If it fails, in serial computing the previous packing fraction
             #  is assigned as the current value in values array without any warning, and in parallel - wrong value
             #  from np.empty function is treated as a packing fraction.
             print("End of generation number {}".format(self.CMAES.countiter))
@@ -441,18 +590,30 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.CMAES.result_pretty()
 
         # Pickling of the object
-        # TODO Check, if it works correctly. Maybe pickle self.CMAES separately (it should work, used in cma package).
-        pickle.dump(self, open(self.output_dir + "/_" + self.signature + ".pkl", 'wb'))
+        # pickle.dump(self, open(self.output_dir + "/_" + self.signature + ".pkl", 'wb'))
+        with open(self.output_dir + "/_RSACMAESOptimization.pkl", "wb") as pickle_file:
+            pickle.dump(self, pickle_file)
+        # Pickling stopped working after switching to Python 3.8.1 (probably it doesn't matter)
+        # and moving redirecting output to constructor. After moving redirecting instance variables self.stdout and
+        # self.stderr were created. They can't be pickled, which causes following error:
+        # "TypeError: cannot pickle '_io.TextIOWrapper' object". It was solved by setting __getstate__ method - pickling
+        # and unpickling work correctly now.
         # To unpickle with:
-        # RSACMAESOptim = pickle.load(open(_outrsa_dir + "/" + signature + "/_" + signature + ".pkl", 'rb'))
+        # rsa_cmaes_optimization = pickle.load(open(self.output_dir + "/_RSACMAESOptimization.pkl", "rb"))
+        # It works outside of this module provided that the class of pickled object is imported, e.g.:
+        # "from optrsa import FixedRadiiXYPolydiskRSACMAESOpt".
 
         # TODO Add separate method for making graphs
         # TODO Maybe create another class for analyzing the results of optimization
-        plot_cmaes_graph_in_background(self.CMAES.logger.name_prefix, self.signature)
+        if self.show_graph:
+            plot_cmaes_graph_in_background(self.CMAES.logger.name_prefix, self.signature)
 
+        # if self.output_to_file:
+        #     sys.stdout = stdout
+        #     sys.stderr = stderr
         if self.output_to_file:
-            sys.stdout = stdout
-            sys.stderr = stderr
+            sys.stdout = self.stdout
+            sys.stderr = self.stderr
 
 
 class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
@@ -460,6 +621,8 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
     # mode_rsa_parameters: dict = dict(super().mode_rsa_parameters, particleType="Polydisk")
     # TODO Check, if it is a right way of overriding class attributes (how to get parent class' attribute)
     mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters, particleType="Polydisk")
+
+    wolfram_polydisk_area_eval_num: int = -1
 
     @abc.abstractmethod
     def arg_to_polydisk_attributes(self, arg: np.ndarray) -> Tuple[str, np.ndarray]:
@@ -476,12 +639,38 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         disks_arg = np.reshape(disks_params, (-1, 3))
         wolfram_disks_list = ["Disk[{{{},{}}},{}]".format(*disk) for disk in disks_arg]
         wolfram_disks_str = "{" + ",".join(wolfram_disks_list) + "}"
-        # TODO Check, if the Wolfram Kernel script can be called with shell=False and whether the performance will be
-        #  better
-        area_str = subprocess.check_output(_wolfram_path
-                                           + " -code 'Area[Region[Apply[RegionUnion,{}]]]'".format(wolfram_disks_str),
-                                           stderr=subprocess.STDOUT, shell=True)
+        wolfram_code = "N[Area[Region[Apply[RegionUnion,{}]]]]".format(wolfram_disks_str)
+        # Worked wrong together with ThreadPool parallelization, even when using Python 3.8.1:
+        # wolfram_proc_arguments = [_wolfram_path, "-code", wolfram_code]
+        # area_str = subprocess.check_output(wolfram_proc_arguments, stderr=subprocess.STDOUT)
+        self.wolfram_polydisk_area_eval_num += 1
+        output_file_name = self.output_dir + "/wolfram-polydisk-area-" + str(self.wolfram_polydisk_area_eval_num)\
+            + ".txt"
+        # TODO Check, if output file necessarily has to be created when using system with ">" redirection
+        with open(output_file_name, "w+") as output_file:
+            pass
+        # The solution below works correctly:
+        os.system(" ".join([_wolfram_path, "-code", "'" + wolfram_code + "'", ">", output_file_name]))
+        area_str = ""
+        with open(output_file_name, "r") as output_file:
+            for line in output_file:
+                area_str += line
+        os.remove(output_file_name)
         return float(area_str)
+
+    # TODO Make static?
+    def wolframclient_polydisk_area(self, disks_params: np.ndarray) -> float:
+        """Calculate the area of a polydisk using wolframclient"""
+        disks_arg = np.reshape(disks_params, (-1, 3))
+        wl_session = WolframLanguageSession()
+        w_disks = [wl.Disk([disk[0], disk[1]], disk[2]) for disk in disks_arg]
+        area = wl_session.evaluate(wl.N(wl.Area(wl.Region(wl.Apply(wl.RegionUnion, w_disks)))))
+        # A way to export image with polydisk to file:
+        # wl_session.evaluate(
+        #                 wl.Export("/path/to/file/polydisk.pdf",
+        #                 wl.Graphics([wl.Darker(wl.Green, 0.45), w_disks])))
+        wl_session.terminate()
+        return area
 
     # @abc.abstractmethod
     # def get_arg_signature(self) -> str:
@@ -491,9 +680,10 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         """Function returning rsa3d program's parameter particleAttributes based on arg"""
         coordinates_type, disks_params = self.arg_to_polydisk_attributes(arg)
         disks_num = disks_params.size // 3
-        area = self.wolfram_polydisk_area(disks_params)
+        # area = self.wolfram_polydisk_area(disks_params)
+        area = self.wolframclient_polydisk_area(disks_params)
         particle_attributes_list = [str(disks_num), coordinates_type]
-        # TODO Maybe do it in a more simply way
+        # TODO Maybe do it in a more simple way
         particle_attributes_list.extend(disks_params.astype(np.unicode).tolist())
         particle_attributes_list.append(str(area))
         return " ".join(particle_attributes_list)
@@ -861,7 +1051,7 @@ def optimize_three_fixed_radii_disks(initial_stddevs: float = 1.,
 #  parallel version of objective_function, find an efficient way to get packing fraction and make a method for this,DONE
 #  change simulation_parameters, evol_strat and other variables to class attributes, - DONE
 #  maybe move input file generation to __init__ - DONE
-#  (in __init__: setting packing signature, creating packing_fraction_vs_params.txt, - DONE
+#  (in __init__: setting packing signature, creating packing-fraction-vs-params.txt, - DONE
 #  setting (also default) RSAParameters, generating input file, preparing rsa3d process call sequence
 #  (apart from particleAttributes it is constant during the optimization)), - DONE
 #  separate method for running optimization called run (or execute or optimize - the latter one can be confused
@@ -870,19 +1060,16 @@ def optimize_three_fixed_radii_disks(initial_stddevs: float = 1.,
 #  then program mode with RSAParameters instantiation, calling run method and maybe other actions like plotting graphs
 #  or making wolfram files etc. (respective methods).
 #  The objective is to make running, analyzing and modification of optimization comfortable.
-# TODO Check if rsa3d program puts all particleAttributes to file names
 # TODO Maybe add a method calling rsa3d program in wolfram mode on specified .bin file
-#  - particleAttributes have to be extracted (from filename) and passed, or taken from packing_fraction_vs_params.txt
+#  - particleAttributes may be taken from rsa-simulation-input.txt file
 # TODO Adding box constraints based on feasible anisotropy (probably)
-# TODO Maybe use multiprocessing module for parallel computation (Better subprocess or multiprocessing?
-#  Does writing to the single packing_fractions_vs_params.txt file by paralleled processes pose a problem?)
+# TODO Does writing to the single packing-fraction-vs-params.txt file by paralleled processes pose a problem?
 # TODO Maybe decreasing packing fraction error in subsequent generations by accuracy mode
 #  or increasing the number of collectors. Maybe combine that with decreasing the population.
 # TODO Algorithms for noisy optimization: UH-CMA-ES (cma.NoiseHandler)? DX-NES-UE?
 # TODO Maybe single, big collectors and uncertainty handling (variable numbers of reevaluations,
 #  thus variable numbers of collectors - UH-CMA-ES)?
-# TODO Add random seed generation to rsa3d program
-# TODO Push accuracy mode changes to rsa3d program's repository
+# TODO Use random seed generation in rsa3d program
 # TODO Add making correct graphs
 # TODO Test on server
 # TODO Check if the optimization works correctly
@@ -924,14 +1111,16 @@ if __name__ == '__main__':
         initial_mean = np.zeros(2 * disks_num)
         fixed_radii_polydisk_opt = FixedRadiiXYPolydiskRSACMAESOpt(initial_mean=initial_mean,
                                                                    initial_stddevs=initial_stddevs,
-                                                                   cma_options={"maxiter": 10,
+                                                                   cma_options={"maxiter": 2,  # 10
                                                                                 "verb_disp": 1,
-                                                                                "verbose": 4},
-                                                                   rsa_parameters={"surfaceVolume": "50.",  #500.
+                                                                                "verbose": 4,
+                                                                                "popsize": 3
+                                                                                },
+                                                                   rsa_parameters={"surfaceVolume": "500.",  #50.
                                                                                    "storePackings": "true"},
                                                                    accuracy=0.01,  # Debugging
-                                                                   parallel=False,
-                                                                   output_to_file=False,  # Debugging (redirecting to
-                                                                   # file worked correctly, but writing was delayed)
-                                                                   signature_suffix="test-2-serial")
+                                                                   parallel=True,
+                                                                   output_to_file=True,
+                                                                   # show_graph=True,
+                                                                   signature_suffix="test-3-pool-parallel")
         fixed_radii_polydisk_opt.run()

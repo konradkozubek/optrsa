@@ -1,5 +1,7 @@
 # Python virtual environment
-virtualenv/
+optrsa-py-3-8-1-venv/
+# Python cache
+__pycache__/
 # Executables directory
 exec/
 # Inputs directory
