@@ -16,12 +16,15 @@ import matplotlib.pyplot as plt
 
 import numpy as np
 
+import argparse
+import json
 from typing import Callable, Tuple, Union, List
 import abc
 import io
 import os
 import glob
 import shutil
+import pprint
 import timeit
 import subprocess
 import multiprocessing.pool
@@ -41,8 +44,9 @@ _wolfram_path = _proj_dir + "/exec/wolframscript"
 _rsa_path = _proj_dir + "/exec/rsa.2.1"
 # Absolute paths to input and output directories
 _input_dir = _proj_dir + "/input"
-_outrsa_dir = _proj_dir + "/outrsa"
-_outcmaes_dir = _proj_dir + "/outcmaes"
+_output_dir = _proj_dir + "/output"
+_outrsa_dir = _proj_dir + "/outrsa"  # To be removed
+_outcmaes_dir = _proj_dir + "/outcmaes"  # To be removed
 graph_processes = []
 
 
@@ -148,7 +152,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  input_rel_path: str = None,
                  output_to_file: bool = True,
                  show_graph: bool = False,
-                 signature_suffix: str = None) -> None:
+                 signature_suffix: str = None,
+                 optimization_input: dict = None) -> None:
 
         self.initial_mean = initial_mean
         self.initial_stddevs = initial_stddevs
@@ -159,6 +164,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.parallel = parallel
         self.output_to_file = output_to_file
         self.show_graph = show_graph
+        self.optimization_input = optimization_input
 
         # Set optimization signature
         self.signature = datetime.datetime.now().isoformat(timespec="milliseconds")  # Default timezone is right
@@ -167,11 +173,21 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.signature += ("-" + signature_suffix) if signature_suffix is not None else ""
         self.signature = self.signature.replace(":", "-").replace(".", "_")
 
-        # Create output directory
-        self.output_dir = _outrsa_dir + "/" + self.signature
+        # Create output directory and subdirectories for RSA and CMAES output
+        self.output_dir = _output_dir + "/" + self.signature
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
+        self.rsa_output_dir = self.output_dir + "/outrsa"
+        if not os.path.exists(self.rsa_output_dir):
+            os.makedirs(self.rsa_output_dir)
+        self.cmaes_output_dir = self.output_dir + "/outcmaes"
+        if not os.path.exists(self.cmaes_output_dir):
+            os.makedirs(self.cmaes_output_dir)
         # Maybe use shutil instead
+
+        # Generate used optimization input file in output directory
+        with open(self.output_dir + "/optimization-input.json", "w+") as opt_input_file:
+            json.dump(self.optimization_input, opt_input_file, indent=2)
 
         # Update self.rsa_parameters by optimization-type-specific parameters
         self.rsa_parameters.update(self.mode_rsa_parameters)
@@ -180,7 +196,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         if "particleAttributes" in rsa_parameters:
             del rsa_parameters["particleAttributes"]
         self.input_given = input_rel_path is not None
-        self.input_filename = _proj_dir + "/" + input_rel_path if self.input_given else None
+        self.input_filename = _input_dir + "/" + input_rel_path if self.input_given else None
         # When input file is not given, self.all_rsa_parameters dictionary will be used with self.default_rsa_parameters
         # overwritten by self.rsa_parameters specified in the constructor
         self.all_rsa_parameters = dict(self.default_rsa_parameters, **self.rsa_parameters) if not self.input_given\
@@ -247,11 +263,13 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             sys.stdout = output_file
             sys.stderr = output_file
             # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
+            #  Data is written after the end of each generation.
         # Create CMA evolution strategy optimizer object
         # TODO Maybe add serving input files and default values for CMA-ES options (currently directly self.cma_options)
         self.CMAES = cma.CMAEvolutionStrategy(self.initial_mean, self.initial_stddevs,
                                               inopts=self.cma_options)
-        self.CMAES.logger.name_prefix += self.signature + "/"  # Default name_prefix is outcmaes/
+        # self.CMAES.logger.name_prefix += self.signature + "/"  # Default name_prefix is outcmaes/
+        self.CMAES.logger.name_prefix = self.cmaes_output_dir + "/"
 
         # Settings for parallel computation
         # TODO Test if it works in all cases
@@ -311,7 +329,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #  (self.simulations_num should be fine to ensure distinction)
         # Create subdirectory for output of rsa3d program in this simulation.
         # simulation_labels contain generation number, candidate number and evaluation number.
-        simulation_output_dir = self.output_dir + "/" + simulation_labels.replace(",", "_")
+        simulation_output_dir = self.rsa_output_dir + "/" + simulation_labels.replace(",", "_")
         if not os.path.exists(simulation_output_dir):
             os.makedirs(simulation_output_dir)
         # Maybe use shutil instead
@@ -327,7 +345,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # with open(rsa_output_filename, "w+") as rsa_output_file:
         #     # Open a process with simulation
         #     with subprocess.Popen(rsa_proc_arguments, stdout=rsa_output_file, stderr=rsa_output_file,
-        #                           cwd=self.output_dir) as rsa_process:
+        #                           cwd=self.rsa_output_dir) as rsa_process:
         #         rsa_process.wait()
 
         rsa_output_file = open(rsa_output_filename, "w+")
@@ -438,7 +456,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #  (self.simulations_num should be fine to ensure distinction)
         # Create subdirectory for output of rsa3d program in this simulation.
         # simulation_labels contain generation number, candidate number and evaluation number.
-        simulation_output_dir = self.output_dir + "/" + simulation_labels.replace(",", "_")
+        simulation_output_dir = self.rsa_output_dir + "/" + simulation_labels.replace(",", "_")
         if not os.path.exists(simulation_output_dir):
             os.makedirs(simulation_output_dir)
             # Maybe use shutil instead
@@ -565,7 +583,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             # TODO Maybe in future add plotting an image of a shape corresponding to mean candidate solution
             #  (plotting using matplotlib)
             print("Phenotype candidates:")
-            print(pheno_candidates)
+            pprint.pprint(pheno_candidates)
             # values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
             #     else self.evaluate_generation_serial(pheno_candidates)
             values = self.evaluate_generation_parallel_in_pool(pheno_candidates) if self.parallel\
@@ -585,8 +603,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.CMAES.logger.disp([-1])
             print()
         print("\nEnd of optimization\n")
-        print(self.CMAES.stop())
-        print(self.CMAES.result)
+        pprint.pprint(self.CMAES.result)
         self.CMAES.result_pretty()
 
         # Pickling of the object
@@ -1040,7 +1057,46 @@ def optimize_three_fixed_radii_disks(initial_stddevs: float = 1.,
     plot_cmaes_graph_in_background(evol_strat.logger.name_prefix, "Two disks fixed radii")
 
 
-# TODO Maybe use argparse module
+def optimize() -> None:
+
+    # if sys.argv[1] == "optfixedradii":
+    #     if sys.argv[3] != "None":
+    #         input_rel_path = sys.argv[3]
+    #     else:
+    #         input_rel_path = None
+    #     # TODO Rearrange arguments and delete if - solution below is to guarantee backward compatibility
+    #     if len(sys.argv) < 6:
+    #         optimize_fixed_radii_disks(disks_num=int(sys.argv[2]), input_rel_path=input_rel_path,
+    #                                    store_packings=bool(int(sys.argv[4])))
+    #     else:
+    #         optimize_fixed_radii_disks(disks_num=int(sys.argv[2]), initial_stddevs=float(sys.argv[5]),
+    #                                    input_rel_path=input_rel_path, store_packings=bool(int(sys.argv[4])))
+    # elif sys.argv[1] == "optthreefixedradii":
+    #     if sys.argv[4] != "None":
+    #         input_rel_path = sys.argv[4]
+    #     else:
+    #         input_rel_path = None
+    #     optimize_three_fixed_radii_disks(initial_stddevs=float(sys.argv[2]), input_rel_path=input_rel_path,
+    #                                      store_packings=bool(int(sys.argv[3])))
+
+    def opt_fixed_radii() -> None:
+        initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["disks_num"])
+        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        fixed_radii_polydisk_opt = FixedRadiiXYPolydiskRSACMAESOpt(**opt_class_args)
+        fixed_radii_polydisk_opt.run()
+
+    opt_modes = {
+        "optfixedradii": opt_fixed_radii
+    }
+    if args.file is None:
+        raise TypeError("In optimize mode input file has to be specified using -f argument")
+    with open(_input_dir + "/" + args.file, "r") as opt_input_file:
+        # TODO Maybe use configparser module instead
+        optimization_input = json.load(opt_input_file)
+    opt_modes[optimization_input["opt_mode"]]()
+
 # TODO Maybe prepare a Makefile like in https://docs.python-guide.org/writing/structure/ and with creating
 #  virtual environment (check how PyCharm creates virtualenvs)
 # TODO Object-oriented implementation of optimization - class RSACMAESOptimization, - partly DONE
@@ -1078,49 +1134,18 @@ def optimize_three_fixed_radii_disks(initial_stddevs: float = 1.,
 # TODO Check, if rsa3d options are well chosen (especially split) and wonder, if they should be somehow
 #  automatically adjusted during optimization
 if __name__ == '__main__':
-    if sys.argv[1] == "testcma":
-        test_cma_package()
-    elif sys.argv[1] == "examplecmaplots":
-        example_cma_plots()
-    elif sys.argv[1] == "optfixedradii":
-        if sys.argv[3] != "None":
-            input_rel_path = sys.argv[3]
-        else:
-            input_rel_path = None
-        # TODO Rearrange arguments and delete if - solution below is to guarantee backward compatibility
-        if len(sys.argv) < 6:
-            optimize_fixed_radii_disks(disks_num=int(sys.argv[2]), input_rel_path=input_rel_path,
-                                       store_packings=bool(int(sys.argv[4])))
-        else:
-            optimize_fixed_radii_disks(disks_num=int(sys.argv[2]), initial_stddevs=float(sys.argv[5]),
-                                       input_rel_path=input_rel_path, store_packings=bool(int(sys.argv[4])))
-    elif sys.argv[1] == "optthreefixedradii":
-        if sys.argv[4] != "None":
-            input_rel_path = sys.argv[4]
-        else:
-            input_rel_path = None
-        optimize_three_fixed_radii_disks(initial_stddevs=float(sys.argv[2]), input_rel_path=input_rel_path,
-                                         store_packings=bool(int(sys.argv[3])))
-    elif sys.argv[1] == "optfixedradiiclass":
-        disks_num = int(sys.argv[2])
-        initial_stddevs = float(sys.argv[3])
-        if sys.argv[4] != "None":
-            input_rel_path = sys.argv[4]
-        else:
-            input_rel_path = None
-        initial_mean = np.zeros(2 * disks_num)
-        fixed_radii_polydisk_opt = FixedRadiiXYPolydiskRSACMAESOpt(initial_mean=initial_mean,
-                                                                   initial_stddevs=initial_stddevs,
-                                                                   cma_options={"maxiter": 2,  # 10
-                                                                                "verb_disp": 1,
-                                                                                "verbose": 4,
-                                                                                "popsize": 3
-                                                                                },
-                                                                   rsa_parameters={"surfaceVolume": "500.",  #50.
-                                                                                   "storePackings": "true"},
-                                                                   accuracy=0.01,  # Debugging
-                                                                   parallel=True,
-                                                                   output_to_file=True,
-                                                                   # show_graph=True,
-                                                                   signature_suffix="test-3-pool-parallel")
-        fixed_radii_polydisk_opt.run()
+    module_description = "Optimization of packing fraction of two-dimensional Random Sequential Adsorption (RSA)" \
+                         " packings\nusing Covariance Matrix Adaptation Evolution Strategy (CMA-ES)."
+    # TODO Maybe automate adding modes, for example using (parametrized) decorators
+    module_modes = {
+        "testcma": test_cma_package,
+        "examplecmaplots": example_cma_plots,
+        "optimize": optimize
+    }
+    arg_parser = argparse.ArgumentParser(description=module_description)
+    # TODO Maybe use sub-commands for modes (arg_parser.add_subparsers)
+    arg_parser.add_argument("mode", choices=list(module_modes), help="program mode")
+    # TODO Make this argument obligatory for optimize mode
+    arg_parser.add_argument("-f", "--file", help="json input file from ./input directory")
+    args = arg_parser.parse_args()
+    module_modes[args.mode]()
