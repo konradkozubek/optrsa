@@ -3,12 +3,12 @@ import cma
 
 import matplotlib
 # PyCharm Professional sets other backend, which may cause trouble
-if sys.platform.startswith('darwin'): # MacOS
+if sys.platform.startswith('darwin'):  # MacOS
     matplotlib.use('MacOSX')
 else:
-    # Not tested, may need additional dependencies.
+    # Not tested
     # See https://matplotlib.org/tutorials/introductory/usage.html#backends
-    matplotlib.use("Qt5Agg")
+    matplotlib.use("Qt5Agg")  # TkAgg
 import matplotlib.pyplot as plt
 
 if __name__ == '__main__':
