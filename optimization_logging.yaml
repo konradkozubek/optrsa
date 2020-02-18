@@ -1,0 +1,29 @@
+version: 1
+formatters:
+  optimization:
+    class: optrsa.OptimizationFormatter  # prepares runningTime attribute and deals with multiline messages
+    # Full format:
+    # format: "[{asctime} rt:{runningTime} pn:{processName} p:{process} tn:{threadName} t:{thread} {funcName} {levelname}] {message}"
+    format: "[{asctime} rt:{runningTime} p:{process} t:{threadName} {funcName} {levelname}] {message}"
+    # datefmt: "%Y-%m-%dT%H-%M-%S.%s"
+    datefmt: "%Y-%m-%d %H:%M:%S.%s"  # %s appears to work - alternative: use msecs attribute in format
+    style: "{"
+handlers:
+  optimization_logfile:
+    class: logging.FileHandler
+    level: INFO
+    formatter: optimization
+  debug_stdout:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: optimization # or standard formatter (don't set it then)
+    stream: ext://sys.stdout
+loggers:
+  optrsa.optimization:
+    level: DEBUG
+    handlers: [optimization_logfile]
+    # propagate: no  # to disable printing to console
+root:
+  # root is the root of loggers' hierarchy and will get propagated log records
+  level: DEBUG
+  handlers: [debug_stdout]

@@ -19,18 +19,22 @@ import matplotlib.transforms
 import matplotlib.offsetbox
 import matplotlib.patches
 import matplotlib.text
+import matplotlib_shiftable_annotation
 
 import numpy as np
 
 import argparse
 import json
 import pandas as pd
-from typing import Callable, Tuple, Union, List
+from typing import Callable, Tuple, Union, List, Optional
 import abc
 import io
 import os
 import glob
 import shutil
+import logging
+import logging.config
+import yaml
 import pprint
 import timeit
 import subprocess
@@ -54,6 +58,7 @@ _input_dir = _proj_dir + "/input"
 _output_dir = _proj_dir + "/output"
 _outrsa_dir = _proj_dir + "/outrsa"  # To be removed
 _outcmaes_dir = _proj_dir + "/outcmaes"  # To be removed
+_cmaes_logging_config = _proj_dir + "/optimization_logging.yaml"
 graph_processes = []
 
 
@@ -133,6 +138,73 @@ def wolfram_polydisk_area(arg: np.ndarray) -> float:
     return float(area_str)
 
 
+class StreamToLogger:
+    """
+    Source: https://stackoverflow.com/questions/11124093/redirect-python-print-output-to-logger/11124247
+    Fake file-like stream object that redirects writes to a logger instance.
+    """
+    def __init__(self, logger, log_level=logging.INFO):
+        self.logger = logger
+        self.log_level = log_level
+        self.linebuf = ""
+
+    def write(self, buf):
+        temp_linebuf = self.linebuf + buf
+        self.linebuf = ""
+        for line in temp_linebuf.splitlines(True):
+            # From the io.TextIOWrapper docs:
+            #   On output, if newline is None, any '\n' characters written
+            #   are translated to the system default line separator.
+            # By default sys.stdout.write() expects '\n' newlines and then
+            # translates them so this is still cross platform.
+            if line[-1] == "\n":
+                self.logger.log(self.log_level, line.rstrip())
+            else:
+                self.linebuf += line
+
+    def flush(self):
+        if self.linebuf != "":
+            self.logger.log(self.log_level, self.linebuf.rstrip())
+        self.linebuf = ""
+
+
+class OptimizationFormatter(logging.Formatter):
+    """
+    Partly inspired by https://stackoverflow.com/questions/18639387/how-change-python-logging-to-display-time-passed
+    -from-when-the-script-execution
+    """
+    def format(self, record):
+        # It seems that this method may be called multiple times when processing a log record, so modifying record's
+        # attributes based on their previous values (e.g. extending a string) won't work as expected (can be done
+        # multiple times).
+        # Add attribute with readable running time (time since logging module was loaded)
+        time_diff = str(datetime.timedelta(milliseconds=record.relativeCreated))
+        record.runningTime = time_diff[:-3]
+        # return super(OptimizationFormatter, self).format(record)
+
+        # Dealing with logging messages with multiple lines
+        # Record before calling format has only msg attribute, message attribute is created in format method
+        # To illustrate it (and the fact that the format method is called multiple times) uncomment:
+        # with open("test.txt", "a") as file:
+        #     file.write(record.msg + " " + str(hasattr(record, "message")) + "\n")
+        message = record.getMessage()
+        if "\n" not in message or record.exc_info or record.exc_text or record.stack_info:
+            # If the message doesn't contain newlines or contains exception or stack information, print in a standard
+            # way without dealing with newlines
+            return super(OptimizationFormatter, self).format(record)
+        else:
+            msg = record.msg
+            record.msg = ""
+            prefix = super(OptimizationFormatter, self).format(record)
+            record.msg = msg
+            indentation = " " * len(prefix)
+            message_lines = message.split("\n")
+            output = prefix + message_lines.pop(0) + "\n"
+            for line in message_lines:
+                output += indentation + line + "\n"
+            return output[:-1]
+
+
 class RSACMAESOptimization(metaclass=abc.ABCMeta):
     """
     Abstract base class for performing optimization of RSA packing fraction with CMA-ES optimizer
@@ -179,8 +251,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  accuracy: float = 0.001,
                  parallel: bool = True,
                  threads: int = None,
+                 particle_attributes_parallel: bool = False,
                  input_rel_path: str = None,
                  output_to_file: bool = True,
+                 output_to_stdout: bool = False,
                  log_generations: bool = True,
                  show_graph: bool = False,
                  signature_suffix: str = None,
@@ -193,7 +267,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.rsa_parameters = rsa_parameters if rsa_parameters is not None else {}
         self.accuracy = accuracy
         self.parallel = parallel
+        self.particle_attributes_parallel = particle_attributes_parallel
         self.output_to_file = output_to_file
+        self.output_to_stdout = output_to_stdout
         self.log_generations = log_generations
         self.show_graph = show_graph
         self.optimization_input = optimization_input
@@ -274,6 +350,25 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
         self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
 
+        # Configure and set optimization state logger
+        # Logs can be printed to a logfile or to the standard output. By default, logfile will contain log records of
+        # severity level at least logging.INFO and standard output - at least logging.DEBUG.
+        with open(_cmaes_logging_config) as config_file:
+            logging_configuration = yaml.full_load(config_file)
+        if self.output_to_file:
+            # To set handlers' filename, modify configuration dictionary as below, try to set it to a variable in
+            # configuration file, use logger's addHandler method or modify logger.handlers[0] (probably it is not
+            # possible to specify file name after handler was instatiated)
+            logging_configuration["handlers"]["optimization_logfile"]["filename"] = self.output_dir\
+                + "/optimization-output.log"
+        else:
+            logging_configuration["loggers"]["optrsa.optimization"]["handlers"].pop(0)
+            del logging_configuration["handlers"]["optimization_logfile"]
+        if not self.output_to_stdout:
+            logging_configuration["loggers"]["optrsa.optimization"]["propagate"] = False
+        logging.config.dictConfig(logging_configuration)
+        self.logger = logging.getLogger("optrsa.optimization")
+        # Maybe optionally add a handler to print everything to the console
         # TODO Maybe move these definitions to run method (then redirecting output will be done only in run method and
         #  CMAES initialization information will be added to output file).
         #  Then change here self.CMAES initialization to self.CMAES = None.
@@ -285,19 +380,20 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.candidate_num = 0
         # Redirect output - done here to catch CMAES initialization information. To be moved to run method together
         # with CMAES initialization
-        if self.output_to_file:
-            self.stdout = sys.stdout
-            self.stderr = sys.stderr
-            # If a decorator for redirecting output were used, a "with" statement could have been used
-            # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
-            # output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
-            output_file = open(self.output_dir + "/optimization-output.txt", "w+")
-            sys.stdout = output_file
-            sys.stderr = output_file
-            # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
-            #  Data is written after the end of each generation.
+        # if self.output_to_file:
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        # If a decorator for redirecting output were used, a "with" statement could have been used
+        # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
+        # output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
+        # output_file = open(self.output_dir + "/optimization-output.log", "w+")
+        sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
+        sys.stderr = StreamToLogger(logger=self.logger, log_level=logging.ERROR)
+        # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
         # Create CMA evolution strategy optimizer object
         # TODO Maybe add serving input files and default values for CMA-ES options (currently directly self.cma_options)
+        self.logger.info(msg="Optimization class: {}".format(self.__class__.__name__))
+        self.logger.info(msg="Optimizer:")
         self.CMAES = cma.CMAEvolutionStrategy(self.initial_mean, self.initial_stddevs,
                                               inopts=self.cma_options)
         # self.CMAES.logger.name_prefix += self.signature + "/"  # Default name_prefix is outcmaes/
@@ -333,11 +429,45 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # method to avoid modifying the original state
         state = self.__dict__.copy()
         # Remove the unpicklable entries
-        unpicklable_attributes = ["stdout", "stderr"]
+        unpicklable_attributes = ["stdout", "stderr", "logger"]
         for attr in unpicklable_attributes:
             if attr in state:
                 del state[attr]
         return state
+
+    def __setstate__(self, state):
+        """
+        Method modifying unpickling behaviour of the class' instance.
+        See https://docs.python.org/3/library/pickle.html#handling-stateful-objects.
+        It needs to be overridden by a child class if it defines another unpicklable attributes.
+        """
+
+        # Restore pickled instance attributes
+        self.__dict__.update(state)
+
+        # Restore unpicklable attributes
+        # Configure and set optimization state logger
+        # TODO Check, if the file handler always appends to the file and doesn't truncate it at the beginning
+        with open(_cmaes_logging_config) as config_file:
+            logging_configuration = yaml.full_load(config_file)
+        if self.output_to_file:
+            # To set handlers' filename, modify configuration dictionary as below, try to set it to a variable in
+            # configuration file, use logger's addHandler method or modify logger.handlers[0] (probably it is not
+            # possible to specify file name after handler was instatiated)
+            logging_configuration["handlers"]["optimization_logfile"]["filename"] = self.output_dir \
+                                                                                    + "/optimization-output.log"
+        else:
+            logging_configuration["loggers"]["optrsa.optimization"]["handlers"].pop(0)
+            del logging_configuration["handlers"]["optimization_logfile"]
+        if not self.output_to_stdout:
+            logging_configuration["loggers"]["optrsa.optimization"]["propagate"] = False
+        logging.config.dictConfig(logging_configuration)
+        self.logger = logging.getLogger("optrsa.optimization")
+        # Redirect output
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
+        sys.stderr = StreamToLogger(logger=self.logger, log_level=logging.ERROR)
 
     def pickle(self) -> None:
         with open(self.output_dir + "/_" + self.__class__.__name__ + ".pkl", "wb") as pickle_file:
@@ -499,15 +629,17 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     values[candidate_num] = -mean_packing_fraction
         return values.tolist()  # or list(values), because values.ndim == 1
 
-    def rsa_simulation(self, candidate_num: int, arg: np.ndarray) -> None:
+    def rsa_simulation(self, candidate_num: int, arg: np.ndarray, particle_attributes: Optional[str] = None) -> None:
         """
         Function running simulations for particle shape specified by arg and waiting for rsa3d process.
         It assigns proper number of OpenMP threads to the rsa3d evaluation.
         """
 
+        sim_start_time = datetime.datetime.now()
         # Run a process with rsa3d program running simulation
         rsa_proc_arguments = self.rsa_proc_arguments[:]  # Copy the values of the template arguments
-        particle_attributes = self.arg_to_particle_attributes(arg)
+        if particle_attributes is None:
+            particle_attributes = self.arg_to_particle_attributes(arg)
         rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-particleAttributes=" + particle_attributes)
         # TODO Maybe move part of this code to constructor
         omp_threads_attribute = str(self.omp_threads)
@@ -545,9 +677,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # rsa_output_filename += "_output.txt"
         rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
 
-        print("RSA simulation start: generation no. {}, candidate no. {}, simulation no. {}\nArgument: {}\n"
-              "particleAttributes: {}".format(*simulation_labels.split(","), arg, particle_attributes))
-        sys.stdout.flush()
+        self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {}\n"
+                             "Argument: {}\n"
+                             "particleAttributes: {}".format(*simulation_labels.split(","),
+                                                             pprint.pformat(arg),
+                                                             particle_attributes))
         # TODO To be removed - for debugging
         # print("RSA simulation process call: {}\n".format(" ".join(rsa_proc_arguments)))
         with open(rsa_output_filename, "w+") as rsa_output_file:
@@ -557,15 +691,22 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                   stderr=rsa_output_file,
                                   cwd=simulation_output_dir) as rsa_process:
                 rsa_process.wait()
-        print("RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}".format(
-            *simulation_labels.split(",")))
-        sys.stdout.flush()
+        sim_end_time = datetime.datetime.now()
+        # Get collectors' number
+        rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+                                                             glob.glob(simulation_output_dir + "/*.dat")[0]])
+        collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
+        self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}."
+                             " Time: {}, collectors: {}".format(*simulation_labels.split(","),
+                                                                str(sim_end_time - sim_start_time),
+                                                                str(collectors_num)))
 
     # TODO Maybe find a way to assign more threads to rsa processes when other processes in generation ended and there
     #  are unused threads - probably from the next collector on
     # TODO Maybe find a way to pass arguments to optrsa program's process in runtime to change the overall number of
     #  used threads from the next generation on
-    def evaluate_generation_parallel_in_pool(self, pheno_candidates: List[np.ndarray]) -> List[float]:
+    def evaluate_generation_parallel_in_pool(self, pheno_candidates: List[np.ndarray],
+                                             cand_particle_attributes: Optional[List[str]] = None) -> List[float]:
         """
         Method running rsa simulations for all phenotype candidates in generation.
         It evaluates self.run_simulation method for proper number of candidates in parallel.
@@ -573,13 +714,16 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         concurrent.futures.ThreadPoolExecutor is an alternative with poorer API.
 
         :param pheno_candidates: List of NumPy ndarrays containing phenotype candidates in generation
+        :param cand_particle_attributes: List of candidates' particleAttributes parameters (optional)
         :return: List of fitness function values (minus mean packing fraction) for respective phenotype candidates
         """
         values = np.zeros(len(pheno_candidates), dtype=np.float)
         # It is said that multiprocessing module does not work with class instance method calls,
         # but in this case multiprocessing.pool.ThreadPool seems to work fine with the run_simulation method.
         with multiprocessing.pool.ThreadPool(processes=self.parallel_simulations_number) as pool:
-            pool.starmap(self.rsa_simulation, list(enumerate(pheno_candidates)))
+            simulations_arguments = list(enumerate(pheno_candidates)) if cand_particle_attributes is None\
+                else list(zip(list(range(len(pheno_candidates))), pheno_candidates, cand_particle_attributes))
+            pool.starmap(self.rsa_simulation, simulations_arguments)
             # Maybe read the last packing fraction value after waiting for simulation process in
             # rsa_simulation method and check if the simulation labels are correct (which means that rsa3d program
             # successfully wrote the last line)
@@ -849,7 +993,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 xy = (optimization_data.index[gen_num], optimization_data[packing_frac_col].at[gen_num])
                 offset_x, offset_y = drawings_offset
                 xy_axes = ax.transAxes.inverted().transform(ax.transData.transform(xy))
-                xy_box = (xy_axes[0] + offset_x, xy_axes[1] + offset_y)
+                # Transforming back to data coordinates and using xybox=xy_box, boxcoords="data" instead of
+                # xybox=(xy_axes[0] + offset_x, xy_axes[1] + offset_y), boxcoords="axes fraction",
+                # to assure correct shifting sensitivity (something concerning handling transforms by
+                # DraggableAnnotation with AnnotationBbox is wrongly implemented in matplotlib and using
+                # boxcoords="axes fraction" results in wrongly recalculated mouse's offsets and different
+                # sensitivities in both axes).
+                xy_box = ax.transData.inverted().transform(ax.transAxes.transform((xy_axes[0] + offset_x,
+                                                                                   xy_axes[1] + offset_y)))
                 # Specifying axes' coordinates using ScaledTranslation doesn't work well:
                 # offset_trans = matplotlib.transforms.ScaledTranslation(offset_x, offset_y, ax.transAxes)\
                 #                - matplotlib.transforms.ScaledTranslation(0, 0, ax.transAxes)
@@ -867,26 +1018,28 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 # In AnnotationBbox constructor e.g.: xybox=(xy[0] + 0.2, xy[1] - 0.01), boxcoords="data"
 
                 # drag_part_drawing = matplotlib.offsetbox.DraggableOffsetBox(ax, part_drawing)  # Not needed
+                # Use matplotlib_shiftable_annotation.AnnotationBboxWithShifts for shiftability instead of draggability
                 ab = matplotlib.offsetbox.AnnotationBbox(drawing_area,
                                                          xy=xy,
                                                          xybox=xy_box,
                                                          xycoords="data",
-                                                         boxcoords="axes fraction",
-                                                         # box_alignment=(0.5, 0.5),  # default: (0.5, 0.5)
+                                                         # boxcoords="axes fraction",
+                                                         boxcoords="data",
                                                          pad=0.2,  # 0.4
                                                          fontsize=12,  # 12
                                                          # bboxprops={},
                                                          arrowprops=dict(arrowstyle="simple,"  # "->", "simple"
                                                                                     "head_length=0.2,"
-                                                                                    "head_width=0.1,"  # 0.5
+                                                                                    "head_width=0.3,"  # 0.1, 0.5
                                                                                     "tail_width=0.01",  # 0.2
                                                                          facecolor="black",
                                                                          connectionstyle="arc3,"
                                                                                          "rad=0.3"))
                 ax.add_artist(ab)
-                # AnnotationBbox subclasses matplotlib.text._AnnotationBase, so we can toggle draggability
-                # using the following method:
+                # # AnnotationBbox subclasses matplotlib.text._AnnotationBase, so we can toggle draggability
+                # # using the following method:
                 ab.draggable()
+                # ab.shiftable()
                 # Maybe following is equivalent:
                 # drag_ab = matplotlib.offsetbox.DraggableAnnotation(ab)
 
@@ -956,49 +1109,77 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #     sys.stderr = output_file
         #     # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
 
-        print("\nStart of optimization\n")
-        self.CMAES.logger.add()
+        self.logger.info(msg="")
+        if self.CMAES.countiter == 0:
+            self.logger.info(msg="Start of optimization")
+            self.CMAES.logger.add()
+        else:
+            self.logger.info(msg="Start of resumed optimization")
         while not self.CMAES.stop():
-            print("Generation number {}".format(self.CMAES.countiter))
+            gen_start_time = datetime.datetime.now()
+            self.logger.info(msg="")
+            self.logger.info(msg="Generation number {}".format(self.CMAES.countiter))
             if self.CMAES.countiter > 0:
                 self.CMAES.logger.disp_header()
                 self.CMAES.logger.disp([-1])
             pheno_candidates = self.CMAES.ask()
-            # TODO Maybe add printing standard deviations
-            # TODO Maybe in future add plotting an image of a shape corresponding to mean candidate solution
-            #  (plotting using matplotlib)
-            print("Mean of the distribution:")
-            pprint.pprint(self.CMAES.mean)
-            print("Phenotype candidates:")
-            pprint.pprint(pheno_candidates)
-            sys.stdout.flush()
+            # TODO Maybe add a mode for plotting an image of a shape corresponding to mean candidate solution(s)
+            self.logger.info(msg="Mean of the distribution:")
+            self.logger.info(msg=pprint.pformat(self.CMAES.mean))
+            self.logger.info(msg="Step size: {}".format(str(self.CMAES.sigma)))
+            self.logger.info(msg="Standard deviations:")
+            std_devs = self.CMAES.sigma * self.CMAES.sigma_vec.scaling * self.CMAES.sm.variances ** 0.5
+            self.logger.info(msg=pprint.pformat(std_devs))
+            self.logger.info(msg="Covariance matrix:")
+            covariance_matrix = self.CMAES.sigma ** 2 * self.CMAES.sm.covariance_matrix
+            for line in pprint.pformat(covariance_matrix).split("\n"):  # or .splitlines()
+                self.logger.info(msg=line)
+            self.logger.info(msg="Phenotype candidates:")
+            for line in pprint.pformat(pheno_candidates).split("\n"):
+                self.logger.info(msg=line)
             # values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
             #     else self.evaluate_generation_serial(pheno_candidates)
-            values = self.evaluate_generation_parallel_in_pool(pheno_candidates) if self.parallel\
-                else self.evaluate_generation_serial(pheno_candidates)
+            if self.parallel:
+                if self.particle_attributes_parallel:
+                    values = self.evaluate_generation_parallel_in_pool(pheno_candidates)
+                else:
+                    self.logger.info(msg="Computing candidates' particleAttributes parameters in series")
+                    cand_particle_attributes = [self.arg_to_particle_attributes(arg) for arg in pheno_candidates]
+                    self.logger.info(msg="Candidates' particleAttributes parameters:")
+                    for line in pprint.pformat(cand_particle_attributes, width=200).split("\n"):
+                        self.logger.info(msg=line)
+                    values = self.evaluate_generation_parallel_in_pool(pheno_candidates, cand_particle_attributes)
+            else:
+                values = self.evaluate_generation_serial(pheno_candidates)
             # TODO Check, what happens in case when e.g. None is returned as candidate value, so (I guess)
             #  a reevaluation is conducted
             # TODO Maybe add checking if rsa simulation finished with success and successfully wrote a line to
             #  packing-fraction-vs-params.txt file. If it fails, in serial computing the previous packing fraction
             #  is assigned as the current value in values array without any warning, and in parallel - wrong value
             #  from np.zeros function is treated as a packing fraction.
-            print("End of generation number {}".format(self.CMAES.countiter))
-            print("Candidate values:")
-            print(values)
-            print()
-            sys.stdout.flush()
+            self.logger.info(msg="End of generation number {}".format(self.CMAES.countiter))
+            self.logger.info(msg="Candidate values:")
+            self.logger.info(msg=values)
             if self.log_generations:
+                # Less costly solution: read not only packing fraction, but also standard deviation from
+                # packing-fraction-vs-params.txt file in evaluate_generation_* function and return both values.
+                # File wouldn't be read twice then. For distribution mean, best, median and worst candidate
+                # self.arg_to_particle_attributes would be called. All data read from file by self.log_generation_data
+                # would be available. Standard deviations could be written to optimization-output.log file, too.
                 self.log_generation_data()
             self.CMAES.tell(pheno_candidates, values)
             self.CMAES.logger.add()
             # Pickling of the object
             self.pickle()
-        print("\nEnd of optimization\n")
+            gen_end_time = datetime.datetime.now()
+            self.logger.info("Generation time: {}".format(str(gen_end_time - gen_start_time)))
+        self.logger.info(msg="")
+        self.logger.info(msg="End of optimization")
+        self.logger.info(msg="")
         self.CMAES.logger.disp_header()
         self.CMAES.logger.disp([-1])
-        pprint.pprint(self.CMAES.result)
+        self.logger.info(msg=pprint.pformat(self.CMAES.result))
         self.CMAES.result_pretty()
-        sys.stdout.flush()
         # Pickling of the object
         self.pickle()
 
@@ -1010,9 +1191,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # if self.output_to_file:
         #     sys.stdout = stdout
         #     sys.stderr = stderr
-        if self.output_to_file:
-            sys.stdout = self.stdout
-            sys.stderr = self.stderr
+        # if self.output_to_file:
+        sys.stdout = self.stdout
+        sys.stderr = self.stderr
 
 
 class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
@@ -1214,7 +1395,7 @@ def optimize() -> None:
     if args.file is None:
         raise TypeError("In optimize mode input file has to be specified using -f argument")
     with open(_input_dir + "/" + args.file, "r") as opt_input_file:
-        # TODO Maybe use configparser module instead
+        # TODO Maybe use configparser module or YAML format instead
         optimization_input = json.load(opt_input_file)
     opt_modes[optimization_input["opt_mode"]]()
 
@@ -1229,6 +1410,48 @@ def plot_cmaes_optimization_data() -> None:
     opt_class = getattr(sys.modules[__name__], opt_class_name)
     modulo = int(args.modulo) if args.modulo is not None else None
     opt_class.plot_optimization_data(signature=args.signature, modulo=modulo)
+
+
+def resume_optimization() -> None:
+    if args.signature is None:
+        raise TypeError("In resumeoptimization mode optimization signature has to be specified using -s argument")
+    opt_class_name = args.signature.split("-")[5]
+    # Get optimization class from current module.
+    # If the class is not in current module, module's name has to be passed as sys.modules dictionary's key,
+    # so such classes should put the module name to optimization signature.
+    opt_class = getattr(sys.modules[__name__], opt_class_name)
+    # Optimization directory has to be prepared - e.g. by duplicating original optimization directory and adding
+    # "-restart-1" suffix at the end of the directory name, then (maybe it is necessary - check it) removing directories
+    # in outrsa subdirectory corresponding to simulations in interrupted generation, maybe also removing some entries in
+    # files in outcmaes subdirectory (check, if the call to self.CMAES.logger.add at the beginning of run method won't
+    # spoil anything (it will cause duplicated CMA-ES generation data records).
+    # But many classes' attributes depend on optimization directory - that's why it is better currently to duplicate
+    # original optimization directory and add "-original" suffix at the end of the copied directory name and resume
+    # optimization in original directory
+    optimization = opt_class.unpickle(args.signature)
+    optimization.logger.info(msg="")
+    optimization.logger.info(msg="")
+    optimization.logger.info(msg="Resuming optimization")
+    # Overwrite CMA-ES options, if the file argument was given. It should contain only the dictionary with CMAOptions
+    # TODO Change this behaviour to accept not only CMA-ES options in input file but also optimization options that can
+    #  be changed, and implement making these changes
+    if args.file is not None:
+        with open(_input_dir + "/" + args.file, "r") as opt_input_file:
+            # TODO Maybe use configparser module or YAML format instead
+            cmaes_options = json.load(opt_input_file)
+        # After unpickling output is redirected to logger, so CMAEvolutionStrategy classes' errors and warnings
+        # as e.g. "UserWarning: key popsize ignored (not recognized as versatile) ..." will be logged
+        optimization.CMAES.opts.set(cmaes_options)
+        # Generate used optimization input file in output directory
+        resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds")
+        resume_signature += "-optimization-resume-input"
+        resume_signature = resume_signature.replace(":", "-").replace(".", "_")
+        opt_input_filename = optimization.output_dir + "/" + resume_signature + ".json"
+        with open(opt_input_filename, "w+") as opt_input_file:
+            json.dump(cmaes_options, opt_input_file, indent=2)
+        optimization.logger.info(msg="Optimization resume input file: {}.json".format(resume_signature))
+    # Run optimization
+    optimization.run()
 
 
 # TODO Add managing errors of the rsa3d program and forcing recalculation (or max n recalculations) or resampling of
@@ -1274,7 +1497,9 @@ if __name__ == '__main__':
         "examplecmaplots": example_cma_plots,
         "optimize": optimize,
         # TODO Maybe do it in another way
-        "plotcmaesoptdata": plot_cmaes_optimization_data
+        "plotcmaesoptdata": plot_cmaes_optimization_data,
+        # TODO Test and improve it
+        "resumeoptimization": resume_optimization
     }
     arg_parser = argparse.ArgumentParser(description=module_description)
     # TODO Maybe use sub-commands for modes (arg_parser.add_subparsers)
