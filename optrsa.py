@@ -1185,7 +1185,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                             signal_name = ""
                             if return_code < 0:
                                 # See https://docs.python.org/3/library/subprocess.html#subprocess.Popen.returncode
-                                signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
+                                if sys.platform.startswith("linux"):
+                                    signal_info = subprocess.check_output("kill -l " + str(-return_code), shell=True)
+                                else:
+                                    signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
                                 signal_name = signal_info.decode().strip().upper()
                                 warning_message += ", signal name: {}".format(signal_name)
                             # self.logger.debug(msg=signal_info)
