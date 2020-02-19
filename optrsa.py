@@ -197,11 +197,15 @@ class OptimizationFormatter(logging.Formatter):
             record.msg = ""
             prefix = super(OptimizationFormatter, self).format(record)
             record.msg = msg
-            indentation = " " * len(prefix)
+            # indentation = " " * len(prefix)
+            # message_lines = message.split("\n")
+            # output = prefix + message_lines.pop(0) + "\n"
+            # for line in message_lines:
+            #     output += indentation + line + "\n"
             message_lines = message.split("\n")
-            output = prefix + message_lines.pop(0) + "\n"
+            output = ""
             for line in message_lines:
-                output += indentation + line + "\n"
+                output += prefix + line + "\n"
             return output[:-1]
 
 
@@ -629,10 +633,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     values[candidate_num] = -mean_packing_fraction
         return values.tolist()  # or list(values), because values.ndim == 1
 
-    def rsa_simulation(self, candidate_num: int, arg: np.ndarray, particle_attributes: Optional[str] = None) -> None:
+    def rsa_simulation(self, candidate_num: int, arg: np.ndarray, particle_attributes: Optional[str] = None) -> int:
         """
         Function running simulations for particle shape specified by arg and waiting for rsa3d process.
         It assigns proper number of OpenMP threads to the rsa3d evaluation.
+
+        :param candidate_num: Identification number of the candidate
+        :param arg: Phenotype candidate's point
+        :param particle_attributes: Particle attributes computed for arg - if not given, they are computed
+        :return: RSA simulation's return code
         """
 
         sim_start_time = datetime.datetime.now()
@@ -690,23 +699,26 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                   stdout=rsa_output_file,
                                   stderr=rsa_output_file,
                                   cwd=simulation_output_dir) as rsa_process:
-                rsa_process.wait()
+                return_code = rsa_process.wait()
         sim_end_time = datetime.datetime.now()
         # Get collectors' number
         rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
                                                              glob.glob(simulation_output_dir + "/*.dat")[0]])
         collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
         self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}."
-                             " Time: {}, collectors: {}".format(*simulation_labels.split(","),
-                                                                str(sim_end_time - sim_start_time),
-                                                                str(collectors_num)))
+                             " Time: {}, collectors: {}, return code: {}".format(*simulation_labels.split(","),
+                                                                                 str(sim_end_time - sim_start_time),
+                                                                                 str(collectors_num),
+                                                                                 str(return_code)))
+        return return_code
 
     # TODO Maybe find a way to assign more threads to rsa processes when other processes in generation ended and there
     #  are unused threads - probably from the next collector on
     # TODO Maybe find a way to pass arguments to optrsa program's process in runtime to change the overall number of
     #  used threads from the next generation on
     def evaluate_generation_parallel_in_pool(self, pheno_candidates: List[np.ndarray],
-                                             cand_particle_attributes: Optional[List[str]] = None) -> List[float]:
+                                             cand_particle_attributes: Optional[List[str]] = None)\
+            -> Tuple[List[float], List[int]]:
         """
         Method running rsa simulations for all phenotype candidates in generation.
         It evaluates self.run_simulation method for proper number of candidates in parallel.
@@ -715,15 +727,18 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
 
         :param pheno_candidates: List of NumPy ndarrays containing phenotype candidates in generation
         :param cand_particle_attributes: List of candidates' particleAttributes parameters (optional)
-        :return: List of fitness function values (minus mean packing fraction) for respective phenotype candidates
+        :return: 2-tuple with list of fitness function values (minus mean packing fraction) for respective phenotype
+                 candidates and list of return codes of RSA simulations for respective phenotype candidates. If the
+                 RSA simulation for a candidate failed or was terminated, the respective candidates' value is np.NaN.
         """
-        values = np.zeros(len(pheno_candidates), dtype=np.float)
+        # values = np.zeros(len(pheno_candidates), dtype=np.float)
+        values = np.full(shape=len(pheno_candidates), fill_value=np.NaN, dtype=np.float)
         # It is said that multiprocessing module does not work with class instance method calls,
         # but in this case multiprocessing.pool.ThreadPool seems to work fine with the run_simulation method.
         with multiprocessing.pool.ThreadPool(processes=self.parallel_simulations_number) as pool:
             simulations_arguments = list(enumerate(pheno_candidates)) if cand_particle_attributes is None\
                 else list(zip(list(range(len(pheno_candidates))), pheno_candidates, cand_particle_attributes))
-            pool.starmap(self.rsa_simulation, simulations_arguments)
+            return_codes = pool.starmap(self.rsa_simulation, simulations_arguments)
             # Maybe read the last packing fraction value after waiting for simulation process in
             # rsa_simulation method and check if the simulation labels are correct (which means that rsa3d program
             # successfully wrote the last line)
@@ -747,7 +762,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     values[candidate_num] = -mean_packing_fraction
         # TODO Add checking if there exists a zero value in values list and deal with the error (in such a case
         #  record for corresponding candidate wasn't found in packing-fraction-vs-params.txt file)
-        return values.tolist()  # or list(values), because values.ndim == 1
+        # return values.tolist()  # or list(values), because values.ndim == 1
+        return list(values), return_codes
 
     def log_generation_data(self) -> None:
         func_data = pd.DataFrame(columns=["partattrs", "pfrac", "pfracstddev"])
@@ -1139,17 +1155,102 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 self.logger.info(msg=line)
             # values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
             #     else self.evaluate_generation_serial(pheno_candidates)
+            # TODO Maybe make evaluate_generation_* methods return values as np.ndarray
             if self.parallel:
                 if self.particle_attributes_parallel:
-                    values = self.evaluate_generation_parallel_in_pool(pheno_candidates)
+                    values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates)
                 else:
                     self.logger.info(msg="Computing candidates' particleAttributes parameters in series")
                     cand_particle_attributes = [self.arg_to_particle_attributes(arg) for arg in pheno_candidates]
                     self.logger.info(msg="Candidates' particleAttributes parameters:")
                     for line in pprint.pformat(cand_particle_attributes, width=200).split("\n"):
                         self.logger.info(msg=line)
-                    values = self.evaluate_generation_parallel_in_pool(pheno_candidates, cand_particle_attributes)
+                    values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates,
+                                                                                     cand_particle_attributes)
+                # TODO Implement computing it in parallel (probably using evaluate_generation_parallel_in_pool method,
+                #  use also a function that for number of simulations and simulation number returns number
+                #  of ompThreads)
+                # TODO If computing in series, assign maximal number of OpenMP threads
+                # TODO Maybe add an option to somehow tell the program to end optimization (e.g. kill -KILL an RSA
+                #  process or send a signal to the main process)
+                take_median = np.full(shape=len(pheno_candidates), fill_value=False)
+                # while np.any(np.isnan(values)):
+                while np.any(np.logical_and(np.isnan(values), np.logical_not(take_median))):
+                    for candidate_num, candidate, candidate_value, return_code\
+                            in zip(list(range(len(pheno_candidates))), pheno_candidates, values, return_codes):
+                        if np.isnan(candidate_value):
+                            warning_message = "RSA simulation for candidate no. {} did not succeed." \
+                                              " Return code: {}".format(str(candidate_num),
+                                                                        str(return_code))
+                            signal_name = ""
+                            if return_code < 0:
+                                # See https://docs.python.org/3/library/subprocess.html#subprocess.Popen.returncode
+                                signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
+                                signal_name = signal_info.decode().strip().upper()
+                                warning_message += ", signal name: {}".format(signal_name)
+                            # self.logger.debug(msg=signal_info)
+                            # self.logger.debug(msg=signal_name)
+                            self.logger.warning(msg=warning_message)
+                            random_seed = "seed" in self.rsa_parameters if self.input_given\
+                                else "seed" in self.all_rsa_parameters
+                            # if return_code_name in ["", "TERM"] or (return_code_name == "USR1" and not random_seed):
+                            #     self.logger.warning(msg="Resampling phenotype candidate"
+                            #                             " no. {}".format(str(candidate_num)))
+                            #     new_candidate = self.CMAES.ask(number=1)[0]
+                            #     self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
+                            #     self.logger.info(msg=pprint.pformat(new_candidate))
+                            #     pheno_candidates[candidate_num] = new_candidate
+                            #     return_codes[candidate_num] = self.rsa_simulation(candidate_num, new_candidate)
+                            # elif return_code_name == "USR1" and random_seed:
+                            if signal_name == "USR1" and random_seed:
+                                # To repeat RSA simulation in the same point when random seed RSA parameter is set,
+                                # kill simulation process with "kill -USR1 pid"
+                                self.logger.warning(msg="Repeating RSA simulation for phenotype candidate"
+                                                        " no. {}".format(str(candidate_num)))
+                                return_codes[candidate_num] = self.rsa_simulation(candidate_num, candidate)
+                            elif signal_name == "USR2":
+                                # To set corresponding to RSA simulation phenotype candidate's value to the median
+                                # of other candidates' values, kill simulation process with "kill -USR2 pid"
+                                self.logger.warning(msg="Phenotype candidate's no. {} value will be set to the median"
+                                                        " of other candidates' values".format(str(candidate_num)))
+                                take_median[candidate_num] = True
+                            else:
+                                # To resample phenotype candidate corresponding to RSA simulation,
+                                # kill simulation process in other way, e.g. with "kill pid"
+                                self.logger.warning(msg="Resampling phenotype candidate"
+                                                        " no. {}".format(str(candidate_num)))
+                                new_candidate = self.CMAES.ask(number=1)[0]
+                                self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
+                                self.logger.info(msg=pprint.pformat(new_candidate))
+                                pheno_candidates[candidate_num] = new_candidate
+                                return_codes[candidate_num] = self.rsa_simulation(candidate_num, new_candidate)
+
+                    with open(self.output_filename, "r") as rsa_output_file:
+                        # TODO Maybe find more efficient or elegant solution
+                        # TODO Maybe iterate through lines in file in reversed order - results of the current generation
+                        #  should be at the end
+                        for line in rsa_output_file:
+                            evaluation_data = line.split("\t")
+                            evaluation_labels = evaluation_data[0].split(",")
+                            if int(evaluation_labels[0]) == self.CMAES.countiter:
+                                read_candidate_num = int(evaluation_labels[1])
+                                mean_packing_fraction = float(evaluation_data[1])
+                                values[read_candidate_num] = -mean_packing_fraction
+                if np.any(take_median):
+                    # TODO Maybe make evaluate_generation_* methods return values in np.ndarray - then it would be
+                    #  easier to manipulate the values array
+                    correct_values = []
+                    for val in values:
+                        if not np.isnan(val):
+                            correct_values.append(val)
+                    median_value = np.sort(correct_values)[len(correct_values) // 2]
+                    self.logger.warning(msg="Phenotype candidates' no. {} values"
+                                            " are set to the median of other candidates' values"
+                                            " equal to {}".format(", ".join(map(str, np.nonzero(take_median)[0])),
+                                                                  str(median_value)))
+                    values = [value if not take_med else median_value for value, take_med in zip(values, take_median)]
             else:
+                # TODO Implement checking results in serial computing case
                 values = self.evaluate_generation_serial(pheno_candidates)
             # TODO Check, what happens in case when e.g. None is returned as candidate value, so (I guess)
             #  a reevaluation is conducted
