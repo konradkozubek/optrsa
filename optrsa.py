@@ -494,6 +494,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         return ""
 
     @classmethod
+    def arg_in_domain(cls, arg: np.ndarray) -> bool:
+        """Function checking if arg belongs to the optimization domain"""
+        return True
+
+    @classmethod
     @abc.abstractmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str)\
             -> matplotlib.offsetbox.DrawingArea:
@@ -1138,7 +1143,13 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             if self.CMAES.countiter > 0:
                 self.CMAES.logger.disp_header()
                 self.CMAES.logger.disp([-1])
-            pheno_candidates = self.CMAES.ask()
+            # pheno_candidates = self.CMAES.ask()
+            pheno_candidates = []
+            while len(pheno_candidates) < self.CMAES.popsize:
+                candidate = self.CMAES.ask(number=1)[0]
+                while not self.arg_in_domain(arg=candidate):
+                    candidate = self.CMAES.ask(number=1)[0]
+                pheno_candidates.append(candidate)
             # TODO Maybe add a mode for plotting an image of a shape corresponding to mean candidate solution(s)
             self.logger.info(msg="Mean of the distribution:")
             self.logger.info(msg=pprint.pformat(self.CMAES.mean))
@@ -1200,6 +1211,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                             #     self.logger.warning(msg="Resampling phenotype candidate"
                             #                             " no. {}".format(str(candidate_num)))
                             #     new_candidate = self.CMAES.ask(number=1)[0]
+                            #     while not self.arg_in_domain(arg=new_candidate):
+                            #         new_candidate = self.CMAES.ask(number=1)[0]
                             #     self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
                             #     self.logger.info(msg=pprint.pformat(new_candidate))
                             #     pheno_candidates[candidate_num] = new_candidate
@@ -1223,6 +1236,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                 self.logger.warning(msg="Resampling phenotype candidate"
                                                         " no. {}".format(str(candidate_num)))
                                 new_candidate = self.CMAES.ask(number=1)[0]
+                                while not self.arg_in_domain(arg=new_candidate):
+                                    new_candidate = self.CMAES.ask(number=1)[0]
                                 self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
                                 self.logger.info(msg=pprint.pformat(new_candidate))
                                 pheno_candidates[candidate_num] = new_candidate
@@ -1318,6 +1333,42 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         (disks' coordinates and radii)
         """
         pass
+
+    @classmethod
+    def arg_in_domain(cls, arg: np.ndarray) -> bool:
+        coordinates_type, disks_params = cls.arg_to_polydisk_attributes(arg)
+        # TODO Maybe do it better
+        intersection_tests = {
+            "xy": lambda first_disk, second_disk: np.sqrt((first_disk[0] - second_disk[0]) ** 2
+                                                          + (first_disk[1] - second_disk[1]) ** 2)
+                                                  <= first_disk[3] + second_disk[3],
+            "rt": lambda first_disk, second_disk: np.sqrt((first_disk[0] * np.cos(first_disk[1])
+                                                           - second_disk[0] * np.cos(second_disk[1])) ** 2
+                                                          + (first_disk[0] * np.sin(first_disk[1])
+                                                             - second_disk[0] * np.sin(second_disk[1])) ** 2)
+                                                  <= first_disk[3] + second_disk[3]
+        }
+        if coordinates_type in intersection_tests:
+            disks_intersect = intersection_tests[coordinates_type]
+            disks_args = np.reshape(disks_params, (-1, 3))
+            # Check, if the polydisk is connected by checking if one iteration of DFS of the corresponding
+            # undirected graph visits all of the graph's vertices. Check the vertex corresponding to a free disk in
+            # constrained versions of polydisks.
+            disks_visited = np.full(shape=disks_args.shape[0], fill_value=False)
+
+            # TODO Check if it is correct and sufficiently optimal
+            def polydisk_dfs_visit(disk_index: int) -> None:
+                current_disk_args = disks_args[disk_index]
+                disks_visited[disk_index] = True
+                for checked_disk_index, checked_disk_args in enumerate(disks_args):
+                    if not disks_visited[checked_disk_index] and disks_intersect(checked_disk_args, current_disk_args):
+                        polydisk_dfs_visit(disk_index=checked_disk_index)
+
+            polydisk_dfs_visit(disk_index=0)
+            return np.all(disks_visited)
+        else:
+            raise NotImplementedError("Checking if a polydisk with attributes given in {} coordinates is connected"
+                                      " is not implemented yet.".format(coordinates_type))
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str)\
