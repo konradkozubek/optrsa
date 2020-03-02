@@ -1068,14 +1068,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         drawings_scale = 0.05
         if modulo is None:
             modulo = max(int(data_len * drawings_scale), 1)
-        # particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
-        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.3))
+        particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.1))  # -0.3
         # drawings_offset=(0.1, -0.1)
         particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.1))
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, 0.1))  # -0.1
         # drawings_offset = (0.1, 0.1)
-        # particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
-        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.2))
+        particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.1))  # -0.2
         # drawings_offset=(0.1, 0.)
         # ax.set_xlim(0, 1)
         # ax.set_ylim(0, 1)
@@ -1144,12 +1144,18 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 self.CMAES.logger.disp_header()
                 self.CMAES.logger.disp([-1])
             # pheno_candidates = self.CMAES.ask()
+            # TODO Check, why resampling causes problems in self.CMAES.tell method when population size
+            #  is small and mirroring is used
             pheno_candidates = []
+            resamplings_num = 0
             while len(pheno_candidates) < self.CMAES.popsize:
                 candidate = self.CMAES.ask(number=1)[0]
                 while not self.arg_in_domain(arg=candidate):
                     candidate = self.CMAES.ask(number=1)[0]
+                    resamplings_num += 1
                 pheno_candidates.append(candidate)
+            if resamplings_num > 0:
+                self.logger.info(msg="Resamplings per candidate: {}".format(str(resamplings_num / self.CMAES.popsize)))
             # TODO Maybe add a mode for plotting an image of a shape corresponding to mean candidate solution(s)
             self.logger.info(msg="Mean of the distribution:")
             self.logger.info(msg=pprint.pformat(self.CMAES.mean))
@@ -1341,12 +1347,12 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         intersection_tests = {
             "xy": lambda first_disk, second_disk: np.sqrt((first_disk[0] - second_disk[0]) ** 2
                                                           + (first_disk[1] - second_disk[1]) ** 2)
-                                                  <= first_disk[3] + second_disk[3],
+                                                  <= first_disk[2] + second_disk[2],
             "rt": lambda first_disk, second_disk: np.sqrt((first_disk[0] * np.cos(first_disk[1])
                                                            - second_disk[0] * np.cos(second_disk[1])) ** 2
                                                           + (first_disk[0] * np.sin(first_disk[1])
                                                              - second_disk[0] * np.sin(second_disk[1])) ** 2)
-                                                  <= first_disk[3] + second_disk[3]
+                                                  <= first_disk[2] + second_disk[2]
         }
         if coordinates_type in intersection_tests:
             disks_intersect = intersection_tests[coordinates_type]
