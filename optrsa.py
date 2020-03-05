@@ -408,8 +408,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # TODO multiprocessing.cpu_count() instead? (Usage on server)
         self.parallel_threads_number = threads if threads is not None else os.cpu_count()  # * 2
         self.parallel_simulations_number = min(self.parallel_threads_number, self.CMAES.popsize)
-        self.omp_threads = self.parallel_threads_number // self.CMAES.popsize\
-            if self.parallel and self.parallel_threads_number > self.CMAES.popsize else 1
+        # self.omp_threads = self.parallel_threads_number // self.CMAES.popsize\
+        #     if self.parallel and self.parallel_threads_number > self.CMAES.popsize else 1
 
         # Create file for logging generation data
         self.opt_data_filename = self.output_dir + "/optimization.dat" if self.log_generations else None
@@ -433,7 +433,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # method to avoid modifying the original state
         state = self.__dict__.copy()
         # Remove the unpicklable entries
-        unpicklable_attributes = ["stdout", "stderr", "logger"]
+        unpicklable_attributes = ["stdout", "stderr", "logger", "rsa_processes_stdins"]
         for attr in unpicklable_attributes:
             if attr in state:
                 del state[attr]
@@ -512,6 +512,27 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :return: matplotlib.offsetbox.DrawingArea object with drawn particle
         """
         pass
+
+    def omp_threads_number(self, simulation_number: int, parallel_simulations_number: int,
+                           parallel_threads_number: int) -> int:
+        """
+        Method calculating number of OpenMP threads to assign to rsa3d program's process.
+
+        :param simulation_number: Number (index) of simulation from range [0, parallel_simulations_number - 1]
+        :param parallel_simulations_number: Number of parallel running simulations
+        :param parallel_threads_number: Overall available number of threads to assign to simulations
+        :return: Number of OpenMP threads to assign to rsa3d program's process
+        """
+        if parallel_threads_number < parallel_simulations_number:
+            self.logger.warning(msg="Assigned threads number {} is lower than"
+                                    " parallelized simulations number {}".format(parallel_threads_number,
+                                                                                 parallel_simulations_number))
+        if not self.parallel or parallel_threads_number <= parallel_simulations_number:
+            return 1
+        omp_threads = self.parallel_threads_number // parallel_simulations_number
+        if simulation_number >= parallel_simulations_number * (omp_threads + 1) - self.parallel_threads_number:
+            omp_threads += 1
+        return omp_threads
 
     # TODO Maybe rename this function (to rsa_simulation_serial) and make the second (rsa_simulation_parallel),
     #  and in current function use nested "with" statements for closing process and file objects after waiting for
@@ -638,7 +659,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     values[candidate_num] = -mean_packing_fraction
         return values.tolist()  # or list(values), because values.ndim == 1
 
-    def rsa_simulation(self, candidate_num: int, arg: np.ndarray, particle_attributes: Optional[str] = None) -> int:
+    def rsa_simulation(self, candidate_num: int, arg: np.ndarray,
+                       particle_attributes: Optional[str] = None, omp_threads: Optional[int] = None) -> int:
         """
         Function running simulations for particle shape specified by arg and waiting for rsa3d process.
         It assigns proper number of OpenMP threads to the rsa3d evaluation.
@@ -646,6 +668,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :param candidate_num: Identification number of the candidate
         :param arg: Phenotype candidate's point
         :param particle_attributes: Particle attributes computed for arg - if not given, they are computed
+        :param omp_threads: Number of OpenMP threads to assign to rsa3d program - if not given, they are computed
         :return: RSA simulation's return code
         """
 
@@ -656,11 +679,22 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             particle_attributes = self.arg_to_particle_attributes(arg)
         rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-particleAttributes=" + particle_attributes)
         # TODO Maybe move part of this code to constructor
-        omp_threads_attribute = str(self.omp_threads)
-        if self.parallel and self.parallel_threads_number > self.CMAES.popsize\
-                and candidate_num >= self.CMAES.popsize * (self.omp_threads + 1) - self.parallel_threads_number:
-            omp_threads_attribute = str(self.omp_threads + 1)
+        # omp_threads_attribute = str(self.omp_threads)
+        # if self.parallel and self.parallel_threads_number > self.CMAES.popsize\
+        #         and candidate_num >= self.CMAES.popsize * (self.omp_threads + 1) - self.parallel_threads_number:
+        #     omp_threads_attribute = str(self.omp_threads + 1)
+        if omp_threads is not None:
+            omp_threads_attribute = str(omp_threads)
+        else:
+            if self.parallel:
+                omp_threads_attribute = str(self.omp_threads_number(candidate_num, self.pool_workers_number,
+                                                                    self.parallel_threads_number))
+            else:
+                omp_threads_attribute = str(self.parallel_threads_number)
         rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-ompThreads=" + omp_threads_attribute)
+        # Maybe use candidate_num instead of simulation_num to label rsa3d processes' stdins
+        if self.parallel:
+            simulation_num = self.simulations_num
         simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num), str(self.simulations_num)])
         # Earlier: str(self.simulations_num), str(self.CMAES.countevals), str(self.CMAES.countiter), str(candidate_num)
         # - self.CMAES.countevals value is updated of course only after the end of each generation.
@@ -682,39 +716,66 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         with open(simulation_output_dir + "/rsa-simulation-input.txt", "w+") as rsa_input_file:
             rsa_input_file.write("ompThreads = {}\n".format(omp_threads_attribute))
             rsa_input_file.write("particleAttributes = {}\n".format(particle_attributes))
-        # TODO Maybe problem with wolfram processes will vanish when using two input files (improbable)
         # Create a file for saving the output of rsa3d program
-        # rsa_output_filename = simulation_output_dir + "/packing_" + particle_attributes.replace(" ", "_")
-        # # surfaceVolume parameter is not appended to filename if it is given in input file
-        # if not self.input_given:
-        #     rsa_output_filename += "_" + str(self.all_rsa_parameters["surfaceVolume"])
-        # rsa_output_filename += "_output.txt"
         rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
-
-        self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {}\n"
-                             "Argument: {}\n"
-                             "particleAttributes: {}".format(*simulation_labels.split(","),
-                                                             pprint.pformat(arg),
-                                                             particle_attributes))
-        # TODO To be removed - for debugging
-        # print("RSA simulation process call: {}\n".format(" ".join(rsa_proc_arguments)))
         with open(rsa_output_filename, "w+") as rsa_output_file:
             # Open a process with simulation
             with subprocess.Popen(rsa_proc_arguments,
+                                  stdin=subprocess.PIPE,  # Maybe specify it only if self.parallel
                                   stdout=rsa_output_file,
                                   stderr=rsa_output_file,
                                   cwd=simulation_output_dir) as rsa_process:
+                pid = rsa_process.pid
+                self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {},"
+                                     " PID: {}, ompThreads: {}\n"
+                                     "Argument: {}\n"
+                                     "particleAttributes: {}".format(*simulation_labels.split(","),
+                                                                     pid,
+                                                                     omp_threads_attribute,
+                                                                     pprint.pformat(arg),
+                                                                     particle_attributes))
+                # For debugging
+                # self.logger.debug(msg="RSA simulation process call: {}".format(" ".join(rsa_proc_arguments)))
+                if self.parallel:
+                    self.rsa_processes_stdins[simulation_num] = rsa_process.stdin
                 return_code = rsa_process.wait()
         sim_end_time = datetime.datetime.now()
+        threads_message = ""
+        if self.parallel:
+            self.remaining_pool_simulations -= 1
+            del self.rsa_processes_stdins[simulation_num]
+            if 0 < self.remaining_pool_simulations < self.pool_workers_number:
+                # Send messages with new numbers of OpenMP threads to rsa3d processes
+                # TODO Maybe remember numbers of threads and send messages only when numbers need to be changed
+                threads_message = "\nRemaining parallel simulations: {}." \
+                                  " Increasing numbers of OpenMP threads.\n" \
+                                  "simulation number: ompThreads".format(self.remaining_pool_simulations)
+                for rsa_process_num, remaining_sim_num, rsa_process_stdin\
+                        in zip(list(range(len(self.rsa_processes_stdins))),
+                               list(self.rsa_processes_stdins),
+                               list(self.rsa_processes_stdins.values())):
+                    new_omp_threads = self.omp_threads_number(rsa_process_num, self.remaining_pool_simulations,
+                                                              self.parallel_threads_number)
+                    # Flushing is needed to send the message and the newline is needed for rsa3d program to end reading
+                    # the message
+                    rsa_process_stdin.write("ompThreads:{}\n".format(new_omp_threads).encode())
+                    rsa_process_stdin.flush()
+                    threads_message += "\n{}: {}".format(remaining_sim_num, new_omp_threads)
         # Get collectors' number
         rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
                                                              glob.glob(simulation_output_dir + "/*.dat")[0]])
         collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
-        self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}."
-                             " Time: {}, collectors: {}, return code: {}".format(*simulation_labels.split(","),
-                                                                                 str(sim_end_time - sim_start_time),
-                                                                                 str(collectors_num),
-                                                                                 str(return_code)))
+        self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}, PID: {}."
+                             " Time: {}, collectors: {}, return code: {}"
+                             "{}".format(*simulation_labels.split(","),
+                                         pid,
+                                         str(sim_end_time - sim_start_time),
+                                         str(collectors_num),
+                                         str(return_code),
+                                         threads_message))
+        # self.logger.debug(msg="remaining_pool_simulations: {}, rsa_processes_stdins number: {}".format(
+        #     self.remaining_pool_simulations, len(self.rsa_processes_stdins)))
+        # self.logger.debug(msg="rsa_processes_stdins:\n{}".format(self.rsa_processes_stdins))
         return return_code
 
     # TODO Maybe find a way to assign more threads to rsa processes when other processes in generation ended and there
@@ -738,9 +799,16 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         """
         # values = np.zeros(len(pheno_candidates), dtype=np.float)
         values = np.full(shape=len(pheno_candidates), fill_value=np.NaN, dtype=np.float)
+        # TODO Maybe define these attributes in constructor
+        self.pool_workers_number = self.parallel_simulations_number  # Maybe it will be passed as an argument
+        self.remaining_pool_simulations = len(pheno_candidates)
+        self.rsa_processes_stdins = {}
+        # cand_sim_omp_threads = [self.omp_threads_number(sim_num, self.pool_workers_number,
+        #                                                 self.parallel_threads_number)
+        #                         for sim_num in range(len(pheno_candidates))]
         # It is said that multiprocessing module does not work with class instance method calls,
         # but in this case multiprocessing.pool.ThreadPool seems to work fine with the run_simulation method.
-        with multiprocessing.pool.ThreadPool(processes=self.parallel_simulations_number) as pool:
+        with multiprocessing.pool.ThreadPool(processes=self.pool_workers_number) as pool:
             simulations_arguments = list(enumerate(pheno_candidates)) if cand_particle_attributes is None\
                 else list(zip(list(range(len(pheno_candidates))), pheno_candidates, cand_particle_attributes))
             return_codes = pool.starmap(self.rsa_simulation, simulations_arguments)
@@ -1069,14 +1137,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         if modulo is None:
             modulo = max(int(data_len * drawings_scale), 1)
         particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.1))  # -0.3
-        # drawings_offset=(0.1, -0.1)
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
+        # drawings_offset=(0.1, -0.1) (0.2, -0.3)
         particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, 0.1))  # -0.1
-        # drawings_offset = (0.1, 0.1)
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., 0.1))
+        # drawings_offset = (0.1, 0.1) (0.2, -0.1)
         particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0.2, -0.1))  # -0.2
-        # drawings_offset=(0.1, 0.)
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
+        # drawings_offset=(0.1, 0.) (0.2, -0.2)
         # ax.set_xlim(0, 1)
         # ax.set_ylim(0, 1)
         plt.show()
@@ -1229,7 +1297,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                 # kill simulation process with "kill -USR1 pid"
                                 self.logger.warning(msg="Repeating RSA simulation for phenotype candidate"
                                                         " no. {}".format(str(candidate_num)))
-                                return_codes[candidate_num] = self.rsa_simulation(candidate_num, candidate)
+                                return_codes[candidate_num] = self.rsa_simulation(
+                                    candidate_num, candidate,
+                                    omp_threads=self.parallel_threads_number)
                             elif signal_name == "USR2":
                                 # To set corresponding to RSA simulation phenotype candidate's value to the median
                                 # of other candidates' values, kill simulation process with "kill -USR2 pid"
@@ -1247,7 +1317,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                 self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
                                 self.logger.info(msg=pprint.pformat(new_candidate))
                                 pheno_candidates[candidate_num] = new_candidate
-                                return_codes[candidate_num] = self.rsa_simulation(candidate_num, new_candidate)
+                                return_codes[candidate_num] = self.rsa_simulation(
+                                    candidate_num, new_candidate,
+                                    omp_threads=self.parallel_threads_number)
 
                     with open(self.output_filename, "r") as rsa_output_file:
                         # TODO Maybe find more efficient or elegant solution
