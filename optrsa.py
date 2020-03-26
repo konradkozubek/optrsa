@@ -234,6 +234,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
 
     optimization_data_columns: dict = {"generationnum": np.int,
                                        "meanpartattrs": str,
+                                       "partstddevs": str,
                                        "bestind": np.int, "bestpartattrs": str,
                                        "bestpfrac": np.float, "bestpfracstddev": np.float,
                                        "medianind": np.int, "medianpartattrs": str,
@@ -500,7 +501,17 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str)\
+    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        """
+        Function returning particle attributes' standard deviations based on standard deviations
+        in optimization's space
+        """
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      part_std_devs: Optional[np.ndarray] = None)\
             -> matplotlib.offsetbox.DrawingArea:
         """
         Abstract class method drawing particle described by `particle_attributes` string attribute on
@@ -509,6 +520,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :param particle_attributes: Particle's particleAttributes rsa3d program's parameter string
         :param scaling_factor: Factor for scaling objects drawn on matplotlib.offsetbox.DrawingArea
         :param color: Particle's color specified by matplotlib's color string
+        :param part_std_devs: Particle attributes' standard deviations - they can be given in order to show them on the
+                              drawing of the particle corresponding to the mean of the probability distribution
         :return: matplotlib.offsetbox.DrawingArea object with drawn particle
         """
         pass
@@ -870,6 +883,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                            self.arg_to_particle_attributes(self.CMAES.mean),  # " ".join(map(str, self.CMAES.mean))
                            # TODO Maybe get also standard deviations from self.CMAES.logger or its output file
                            #  self.cmaes_output_dir + "/stddev.dat" - it should have data when this function is called
+                           ",".join(map(str, self.stddevs_to_particle_stddevs(self.stddevs))),
                            str(best_cand.name), best_cand.at["partattrs"],
                            str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
                            str(median_cand.name), median_cand.at["partattrs"],
@@ -886,11 +900,13 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     def save_optimization_data(cls, signature) -> None:
         output_filename = _output_dir + "/" + signature + "/packing-fraction-vs-params.txt"
         mean_output_filename = _output_dir + "/" + signature + "/outcmaes/xmean.dat"
+        stddev_output_filename = _output_dir + "/" + signature + "/outcmaes/stddev.dat"
         # TODO Maybe get also standard deviations from "stddev.dat" file
         opt_data_filename = _output_dir + "/" + signature + "/optimization.dat"
         # Data of the first generation (no. 0) is logged in xmean.dat file, but in some of other CMA-ES output files
         # it is not logged
         generations_mean_data = np.loadtxt(fname=mean_output_filename, comments=['%', '#'])
+        generations_stddev_data = np.loadtxt(fname=stddev_output_filename, comments=['%', '#'])
         with open(output_filename) as output_file, open(opt_data_filename, "w+") as opt_data_file:
             # Write header line
             opt_data_file.write("\t".join(cls.optimization_data_columns) + "\n")
@@ -901,6 +917,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             def save_generation_data() -> None:
                 func_data.sort_values(by="pfrac", ascending=False, inplace=True)
                 mean_arg = generations_mean_data[gen_num, 5:]
+                stddevs = generations_stddev_data[gen_num, 5:]
                 best_cand = func_data.iloc[0]
                 median_cand = func_data.iloc[func_data.shape[0] // 2]
                 worst_cand = func_data.iloc[-1]
@@ -910,6 +927,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 generation_data = [str(gen_num),
                                    cls.arg_to_particle_attributes(mean_arg),
                                    # " ".join(map(str, mean_arg))
+                                   ",".join(map(str, cls.stddevs_to_particle_stddevs(stddevs))),
                                    str(best_cand.name), best_cand.at["partattrs"],
                                    str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
                                    str(median_cand.name), median_cand.at["partattrs"],
@@ -953,7 +971,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #     optimization_data = np.loadtxt(opt_data_file,
         #                                    # dtype={"names": tuple(cls.optimization_data_columns),
         #                                    #        "formats": tuple(cls.optimization_data_columns.values())},
-        #                                    dtype={"names": ("generation_num", "meanpartattrs", "bestind", "bestpfrac"),
+        #                                    dtype={"names": ("generation_num", "meanpartattrs", "bestind",
+        #                                                     "bestpfrac"),
         #                                           # "formats": (np.int, str, np.int, np.float)}
         #                                           "formats": ("i4", "U", "i4", "f4")},  # Debugging
         #                                    delimiter="\t",  # Debugging
@@ -964,7 +983,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # 2) Maybe use function fread from datatable package
 
         # 3) Solution with standard lines reading and filling pd.DataFrame:
-        # optimization_data = pd.DataFrame(columns=list(columns))
+        # optimization_data = pd.DataFrame(opt_data_columns=list(opt_data_columns))
         # with open(opt_data_filename, "r") as opt_data_file:
         #     for line in opt_data_file:
         #         generation_data = line.split("\t")
@@ -976,8 +995,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #     import csv
         #     # opt_data_reader = csv.reader(opt_data_file, delimiter="\t")  # Works right
         #     opt_data_reader = csv.DictReader(opt_data_file, delimiter="\t")  # Works right
-        #     # If candidates' data is in separate columns, remove "candidatesdata" from cls.optimization_data_columns
-        #     # and use restkey="candidatesdata" in csv.DictReader constructor.
+        #     # If candidates' data is in separate opt_data_columns, remove "candidatesdata"
+        #     # from cls.optimization_data_columns and use restkey="candidatesdata" in csv.DictReader constructor.
         #     for record in opt_data_reader:
         #         pprint.pprint(record)
 
@@ -1004,7 +1023,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # plt.rcParams["axes.autolimit_mode"] = "round_numbers"
         fig = plt.figure(num=args.signature, figsize=(10, 6.5))  # figsize is given in inches
         ax = plt.axes()
-        plt.title("CMA-ES optimization of RSA mean packing fraction\nof fixed-radii polydisks")
+        # plt.title("CMA-ES optimization of RSA mean packing fraction\nof fixed-radii polydisks")
         plt.ylabel("Mean packing fraction")
         plt.xlabel("Generation number")
         # TODO Try to adjust ticks automatically
@@ -1039,10 +1058,12 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # update="bbox" does not change this behaviour, but sets legend's position relative to figure, not axes, which
         # is bad.
 
-        def particle_drawings_annotations(part_attrs_col: str, packing_frac_col: str, color: str, modulo: int,
-                                          drawings_scale: float, drawings_offset: Tuple[float, float]) -> None:
+        def particle_drawings_annotations(part_attrs_col: str, packing_frac_col: str = "medianpfrac",
+                                          color: str = "0.5", modulo: int = 1, drawings_scale: float = 0.05,
+                                          drawings_offset: Tuple[float, float] = None, vertical_alignment: float = 0.1,
+                                          position: str = "point", means: bool = False) -> None:
             """
-            Annotate packing fraction data series with draggable particle drawings
+            Annotate packing fraction data series with, draggable if necessary, particle drawings
 
             :param part_attrs_col: Name of the column with particle attributes in optimization_data pd.DataFrame
             :param packing_frac_col: Name of the column with mean packing fractions in optimization_data pd.DataFrame
@@ -1051,12 +1072,17 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             :param drawings_scale: Length of unitary segment in drawing (drawing's scale) given in fraction
                                    of x axis width
             :param drawings_offset: Tuple specifying annotation boxes offset in fraction of axes' width and height
+            :param vertical_alignment: Annotation boxes common vertical position in fraction of axes' height
+            :param position: String specifying type of annotation boxes positioning. "point" - relative to annotated
+                             points' positions - uses drawings_offset argument, "x" - at the same x positions as
+                             annotated points and at the common y position for all annotation boxes,
+                             specified by vertical_alignment argument.
+            :param means: Whether to make annotations corresponding to means of the distributions - among others,
+                          visualize particle attributes' standard deviations
             :return: None
             """
             # TODO Maybe scale drawings' paddings and arrows and boxes' frames relatively to graph's width and height,
             #  similarly as drawings are scaled
-            # TODO Use an argument to specify for how many generations annotations are to be made
-            #  or calculate it somehow.
             #  Maybe use max(int(data_len * drawings_scale), 1) as the default modulo (data points are placed uniformly
             #  on axes, drawings' widths are approximately 1 in drawings' coordinates if in drawings' coordinates
             #  particle area is 1).
@@ -1071,41 +1097,64 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             # how it behaves.
             gen_nums = list(range(0, data_len, modulo))
             if data_len - 1 not in gen_nums:
+                gen_nums.pop()
                 gen_nums.append(data_len - 1)
             for gen_num in gen_nums:
                 part_attrs = optimization_data[part_attrs_col].at[gen_num]
-                # Get particle drawing
-                drawing_area = cls.draw_particle(particle_attributes=part_attrs,
-                                                 scaling_factor=scaling_factor,
-                                                 color=color)
-                # Make annotation
+                # Get particle drawing and set properties of the arrow
+                if not means:
+                    drawing_area = cls.draw_particle(particle_attributes=part_attrs,
+                                                     scaling_factor=scaling_factor,
+                                                     color=color)
+                    arrow_props = dict(arrowstyle="simple,"  # "->", "simple"
+                                                  "head_length=0.2,"
+                                                  "head_width=0.3,"  # 0.1, 0.5
+                                                  "tail_width=0.01",  # 0.2
+                                       facecolor="black",
+                                       connectionstyle="arc3,"
+                                                       "rad=0.3")
+                else:
+                    part_stddevs = np.array(optimization_data["partstddevs"].at[gen_num].split(","), dtype=np.float)
+                    drawing_area = cls.draw_particle(particle_attributes=part_attrs,
+                                                     scaling_factor=scaling_factor,
+                                                     color=color,
+                                                     part_std_devs=part_stddevs)
+                    arrow_props = dict()
+                # Set coordinates and positions of the annotated point and the label with drawing
                 xy = (optimization_data.index[gen_num], optimization_data[packing_frac_col].at[gen_num])
-                offset_x, offset_y = drawings_offset
-                xy_axes = ax.transAxes.inverted().transform(ax.transData.transform(xy))
-                # Transforming back to data coordinates and using xybox=xy_box, boxcoords="data" instead of
-                # xybox=(xy_axes[0] + offset_x, xy_axes[1] + offset_y), boxcoords="axes fraction",
-                # to assure correct shifting sensitivity (something concerning handling transforms by
-                # DraggableAnnotation with AnnotationBbox is wrongly implemented in matplotlib and using
-                # boxcoords="axes fraction" results in wrongly recalculated mouse's offsets and different
-                # sensitivities in both axes).
-                xy_box = ax.transData.inverted().transform(ax.transAxes.transform((xy_axes[0] + offset_x,
-                                                                                   xy_axes[1] + offset_y)))
-                # Specifying axes' coordinates using ScaledTranslation doesn't work well:
-                # offset_trans = matplotlib.transforms.ScaledTranslation(offset_x, offset_y, ax.transAxes)\
-                #                - matplotlib.transforms.ScaledTranslation(0, 0, ax.transAxes)
-                # annotation_trans = ax.transData + offset_trans
-                # In AnnotationBbox constructor: xybox=xy, boxcoords=annotation_trans
+                if position == "point":
+                    box_coords = "data"
+                    offset_x, offset_y = drawings_offset
+                    xy_axes = ax.transAxes.inverted().transform(ax.transData.transform(xy))
+                    # Transforming back to data coordinates and using xybox=xy_box, boxcoords="data" instead of
+                    # xybox=(xy_axes[0] + offset_x, xy_axes[1] + offset_y), boxcoords="axes fraction",
+                    # to assure correct shifting sensitivity (something concerning handling transforms by
+                    # DraggableAnnotation with AnnotationBbox is wrongly implemented in matplotlib and using
+                    # boxcoords="axes fraction" results in wrongly recalculated mouse's offsets and different
+                    # sensitivities in both axes).
+                    xy_box = ax.transData.inverted().transform(ax.transAxes.transform((xy_axes[0] + offset_x,
+                                                                                       xy_axes[1] + offset_y)))
+                    # Specifying axes' coordinates using ScaledTranslation doesn't work well:
+                    # offset_trans = matplotlib.transforms.ScaledTranslation(offset_x, offset_y, ax.transAxes)\
+                    #                - matplotlib.transforms.ScaledTranslation(0, 0, ax.transAxes)
+                    # annotation_trans = ax.transData + offset_trans
+                    # In AnnotationBbox constructor: xybox=xy, boxcoords=annotation_trans
 
-                # Alternative solutions (work well):
-                # 1) Specifying annotation box offset in fraction of figure's width and height:
-                # offset_trans = matplotlib.transforms.ScaledTranslation(offset_x, offset_y, fig.transFigure)
-                # annotation_trans = ax.transData + offset_trans
-                # In AnnotationBbox constructor: xybox=xy, boxcoords=annotation_trans
-                # 2) Displaying annotations at the bottom of axes (legend needs to be shifted then):
-                # In AnnotationBbox constructor: xybox=(xy[0], 0.1), boxcoords=("data", "axes fraction")
-                # 3) Specifying annotation box offset in data coordinates (needs to be adjusted depending on data):
-                # In AnnotationBbox constructor e.g.: xybox=(xy[0] + 0.2, xy[1] - 0.01), boxcoords="data"
+                    # Alternative solutions (work well):
+                    # 1) Specifying annotation box offset in fraction of figure's width and height:
+                    # offset_trans = matplotlib.transforms.ScaledTranslation(offset_x, offset_y, fig.transFigure)
+                    # annotation_trans = ax.transData + offset_trans
+                    # In AnnotationBbox constructor: xybox=xy, boxcoords=annotation_trans
+                    # 2) Displaying annotations at the bottom of axes (legend needs to be shifted then):
+                    # In AnnotationBbox constructor: xybox=(xy[0], 0.1), boxcoords=("data", "axes fraction")
+                    # 3) Specifying annotation box offset in data coordinates (needs to be adjusted depending on data):
+                    # In AnnotationBbox constructor e.g.: xybox=(xy[0] + 0.2, xy[1] - 0.01), boxcoords="data"
+                if position == "x":
+                    box_coords = ("data", "axes fraction")
+                    xy_box = (xy[0], vertical_alignment)
+                    # arrow_props = dict()
 
+                # Make annotation
                 # drag_part_drawing = matplotlib.offsetbox.DraggableOffsetBox(ax, part_drawing)  # Not needed
                 # Use matplotlib_shiftable_annotation.AnnotationBboxWithShifts for shiftability instead of draggability
                 ab = matplotlib.offsetbox.AnnotationBbox(drawing_area,
@@ -1113,40 +1162,52 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                          xybox=xy_box,
                                                          xycoords="data",
                                                          # boxcoords="axes fraction",
-                                                         boxcoords="data",
+                                                         boxcoords=box_coords,
                                                          pad=0.2,  # 0.4
                                                          fontsize=12,  # 12
                                                          # bboxprops={},
-                                                         arrowprops=dict(arrowstyle="simple,"  # "->", "simple"
-                                                                                    "head_length=0.2,"
-                                                                                    "head_width=0.3,"  # 0.1, 0.5
-                                                                                    "tail_width=0.01",  # 0.2
-                                                                         facecolor="black",
-                                                                         connectionstyle="arc3,"
-                                                                                         "rad=0.3"))
+                                                         arrowprops=arrow_props)
                 ax.add_artist(ab)
-                # # AnnotationBbox subclasses matplotlib.text._AnnotationBase, so we can toggle draggability
-                # # using the following method:
-                ab.draggable()
-                # ab.shiftable()
-                # Maybe following is equivalent:
-                # drag_ab = matplotlib.offsetbox.DraggableAnnotation(ab)
+                if position == "point":
+                    # # AnnotationBbox subclasses matplotlib.text._AnnotationBase, so we can toggle draggability
+                    # # using the following method:
+                    ab.draggable()
+                    # ab.shiftable()
+                    # Maybe following is equivalent:
+                    # drag_ab = matplotlib.offsetbox.DraggableAnnotation(ab)
 
         data_len = len(optimization_data["bestpartattrs"])
         drawings_scale = 0.05
         if modulo is None:
             modulo = max(int(data_len * drawings_scale), 1)
         particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
+                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.15))
         # drawings_offset=(0.1, -0.1) (0.2, -0.3)
+        # particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
+        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., 0.1))
+        # # drawings_offset = (0.1, 0.1) (0.2, -0.1)
         particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., 0.1))
-        # drawings_offset = (0.1, 0.1) (0.2, -0.1)
+                                      modulo=modulo, drawings_scale=drawings_scale,
+                                      position="x", vertical_alignment=1.08)
+        # particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
+        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
+        # # drawings_offset=(0.1, 0.) (0.2, -0.2)
         particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
-        # drawings_offset=(0.1, 0.) (0.2, -0.2)
-        # ax.set_xlim(0, 1)
-        # ax.set_ylim(0, 1)
+                                      modulo=modulo, drawings_scale=drawings_scale,
+                                      position="x", vertical_alignment=0.22)
+        particle_drawings_annotations(part_attrs_col="meanpartattrs",
+                                      modulo=modulo, drawings_scale=drawings_scale, position="x", means=True)
+        gen_nums = list(range(0, data_len, modulo))
+        if data_len - 1 not in gen_nums:
+            gen_nums.append(data_len - 1)
+        plt.xticks(gen_nums)
+        # TODO Adjust top limit so that it corresponds to a major tick
+        # ax.set_ymargin(0.1)
+        plt.locator_params(axis="y", nbins=15)
+        # ax.set_xlim(...)
+        bottom_lim, top_lim = ax.get_ylim()
+        bottom_space = 0.3
+        ax.set_ylim(bottom_lim - bottom_space / (1. - bottom_space) * (top_lim - bottom_lim), top_lim)
         plt.show()
 
     # TODO Create this decorator properly - probably in an inner class or create a parameterized decorator outside the
@@ -1229,15 +1290,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.logger.info(msg=pprint.pformat(self.CMAES.mean))
             self.logger.info(msg="Step size: {}".format(str(self.CMAES.sigma)))
             self.logger.info(msg="Standard deviations:")
-            std_devs = self.CMAES.sigma * self.CMAES.sigma_vec.scaling * self.CMAES.sm.variances ** 0.5
-            self.logger.info(msg=pprint.pformat(std_devs))
+            self.stddevs = self.CMAES.sigma * self.CMAES.sigma_vec.scaling * self.CMAES.sm.variances ** 0.5
+            self.logger.info(msg=pprint.pformat(self.stddevs))
             self.logger.info(msg="Covariance matrix:")
-            covariance_matrix = self.CMAES.sigma ** 2 * self.CMAES.sm.covariance_matrix
-            for line in pprint.pformat(covariance_matrix).split("\n"):  # or .splitlines()
+            self.covariance_matrix = self.CMAES.sigma ** 2 * self.CMAES.sm.covariance_matrix
+            for line in pprint.pformat(self.covariance_matrix).split("\n"):  # or .splitlines()
                 self.logger.info(msg=line)
-            self.logger.info(msg="Phenotype candidates:")
+            self.logger.debug(msg="Phenotype candidates:")
             for line in pprint.pformat(pheno_candidates).split("\n"):
-                self.logger.info(msg=line)
+                self.logger.debug(msg=line)
             # values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
             #     else self.evaluate_generation_serial(pheno_candidates)
             # TODO Maybe make evaluate_generation_* methods return values as np.ndarray
@@ -1247,9 +1308,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 else:
                     self.logger.info(msg="Computing candidates' particleAttributes parameters in series")
                     cand_particle_attributes = [self.arg_to_particle_attributes(arg) for arg in pheno_candidates]
-                    self.logger.info(msg="Candidates' particleAttributes parameters:")
+                    self.logger.debug(msg="Candidates' particleAttributes parameters:")
                     for line in pprint.pformat(cand_particle_attributes, width=200).split("\n"):
-                        self.logger.info(msg=line)
+                        self.logger.debug(msg=line)
                     values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates,
                                                                                      cand_particle_attributes)
                 # TODO Implement computing it in parallel (probably using evaluate_generation_parallel_in_pool method,
@@ -1412,6 +1473,11 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         """
         pass
 
+    # @classmethod
+    # @abc.abstractmethod
+    # def stddevs_to_polydisk_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+    #     pass
+
     @classmethod
     def arg_in_domain(cls, arg: np.ndarray) -> bool:
         coordinates_type, disks_params = cls.arg_to_polydisk_attributes(arg)
@@ -1449,18 +1515,28 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
                                       " is not implemented yet.".format(coordinates_type))
 
     @classmethod
-    def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str)\
+    def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      part_std_devs: Optional[np.ndarray] = None)\
             -> matplotlib.offsetbox.DrawingArea:
         # Extract particle data
         # Scale polydisks so that they have unitary area
         part_data = np.array(particle_attributes.split(" ")[2:-1], dtype=np.float).reshape(-1, 3) \
                     / np.sqrt(np.float(particle_attributes.rpartition(" ")[2]))
+        if part_std_devs is not None:
+            std_devs_data = part_std_devs.reshape(-1, 3) / np.sqrt(np.float(particle_attributes.rpartition(" ")[2]))
         # Draw particle
-        # Get polydisk's width and height
-        x_min = np.min(part_data[:, 0] - part_data[:, 2])
-        x_max = np.max(part_data[:, 0] + part_data[:, 2])
-        y_min = np.min(part_data[:, 1] - part_data[:, 2])
-        y_max = np.max(part_data[:, 1] + part_data[:, 2])
+        # Get polydisk drawing's width and height
+        if part_std_devs is None:
+            x_min = np.min(part_data[:, 0] - part_data[:, 2])
+            x_max = np.max(part_data[:, 0] + part_data[:, 2])
+            y_min = np.min(part_data[:, 1] - part_data[:, 2])
+            y_max = np.max(part_data[:, 1] + part_data[:, 2])
+        else:
+            x_min = np.min(np.concatenate((part_data[:, 0] - part_data[:, 2], part_data[:, 0] - std_devs_data[:, 0])))
+            x_max = np.max(np.concatenate((part_data[:, 0] + part_data[:, 2], part_data[:, 0] + std_devs_data[:, 0])))
+            y_min = np.min(np.concatenate((part_data[:, 1] - part_data[:, 2], part_data[:, 1] - std_devs_data[:, 1])))
+            y_max = np.max(np.concatenate((part_data[:, 1] + part_data[:, 2], part_data[:, 1] + std_devs_data[:, 1])))
+            # TODO Take into account also radii standard deviations
         drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * (x_max - x_min),
                                                         scaling_factor * (y_max - y_min),
                                                         scaling_factor * -x_min,
@@ -1473,12 +1549,61 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
             # than transform used when this argument is not passed.
             drawing_area.add_artist(disk)
         for disk_num, disk_args in enumerate(part_data):
-            disk_label = matplotlib.text.Text(x=scaling_factor * disk_args[0], y=scaling_factor * disk_args[1],
-                                              text=str(disk_num),
-                                              horizontalalignment="center",
-                                              verticalalignment="center",
-                                              fontsize=11)
-            drawing_area.add_artist(disk_label)
+            if part_std_devs is None:
+                disk_label = matplotlib.text.Text(x=scaling_factor * disk_args[0], y=scaling_factor * disk_args[1],
+                                                  text=str(disk_num),
+                                                  horizontalalignment="center",
+                                                  verticalalignment="center",
+                                                  fontsize=11)
+                drawing_area.add_artist(disk_label)
+            else:
+                disk_label = matplotlib.text.Text(x=scaling_factor * disk_args[0] + scaling_factor * disk_args[2] / 2,
+                                                  y=scaling_factor * disk_args[1] + scaling_factor * disk_args[2] / 2,
+                                                  text=str(disk_num),
+                                                  horizontalalignment="center",
+                                                  verticalalignment="center",
+                                                  fontsize=9)
+                drawing_area.add_artist(disk_label)
+
+                # test_arrow = matplotlib.patches.FancyArrow(0, 0, scaling_factor * 1, scaling_factor * 1)
+                # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)
+                # test_arrow = matplotlib.patches.FancyArrowPatch(
+                #     (0, 0),
+                #     (scaling_factor * 1 / np.sqrt(np.float(particle_attributes.rpartition(" ")[2])),
+                #      0),
+                #     shrinkA=0,
+                #     shrinkB=0)
+                # drawing_area.add_artist(test_arrow)
+                # test_arrow = matplotlib.patches.FancyArrowPatch(
+                #     (0, 0),
+                #     (scaling_factor * 1 / np.sqrt(np.float(particle_attributes.rpartition(" ")[2])) / np.sqrt(2),
+                #      scaling_factor * 1 / np.sqrt(np.float(particle_attributes.rpartition(" ")[2])) / np.sqrt(2)),
+                #     arrowstyle=arrow_style,
+                #     shrinkA=0,
+                #     shrinkB=0)
+                # # test_arrow = matplotlib.patches.ConnectionPatch((0, 0), (scaling_factor * 1, scaling_factor * 1))
+                # drawing_area.add_artist(test_arrow)
+
+                # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)  # Causes a bug in matplotlib
+                # arrow_style = matplotlib.patches.ArrowStyle("->", head_width=0.8)
+                # Head lengths are not scaled and for small standard deviations heads are longer then arrow, so one
+                # solution is to make them not visible
+                # TODO Make arrows lengths correct while using arrows without heads
+                arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
+                center = (scaling_factor * disk_args[0], scaling_factor * disk_args[1])
+                ticks = [(center[0] + scaling_factor * std_devs_data[disk_num][0], center[1]),
+                         (center[0] - scaling_factor * std_devs_data[disk_num][0], center[1]),
+                         (center[0], center[1] + scaling_factor * std_devs_data[disk_num][1]),
+                         (center[0], center[1] - scaling_factor * std_devs_data[disk_num][1])]
+                for tick in ticks:
+                    std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                        center,
+                        tick,
+                        arrowstyle=arrow_style,
+                        shrinkA=0,
+                        shrinkB=0)
+                    drawing_area.add_artist(std_dev_arrow)
+                # TODO Take into account also radii standard deviations
         return drawing_area
 
     # TODO Make it a class method?
@@ -1569,6 +1694,11 @@ class FixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         arg_with_radii = np.insert(arg, np.arange(2, arg.size + 1, 2), 1.)
         return "xy", arg_with_radii
 
+    @classmethod
+    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        stddevs_with_radii = np.insert(stddevs, np.arange(2, stddevs.size + 1, 2), 0.)
+        return stddevs_with_radii
+
 
 class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
     """
@@ -1601,6 +1731,12 @@ class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         arg_with_standard_disks_radii = np.insert(arg, np.arange(2, arg.size, 2), 1.)
         arg_with_all_disks = np.concatenate((arg_with_standard_disks_radii, np.array([0., 1., 0., 0., 1.])))
         return "xy", arg_with_all_disks
+
+    @classmethod
+    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        stddevs_with_standard_disks_radii = np.insert(stddevs, np.arange(2, stddevs.size, 2), 0.)
+        stddevs_with_all_disks = np.concatenate((stddevs_with_standard_disks_radii, np.zeros(5, dtype=np.float)))
+        return stddevs_with_all_disks
 
 
 def optimize() -> None:
@@ -1651,7 +1787,8 @@ def resume_optimization() -> None:
     opt_class_name = args.signature.split("-")[5]
     # Get optimization class from current module.
     # If the class is not in current module, module's name has to be passed as sys.modules dictionary's key,
-    # so such classes should put the module name to optimization signature.
+    # so such classes should put the module name to optimization signature. Such a class also needs to be explicitly
+    # imported before unpickling.
     opt_class = getattr(sys.modules[__name__], opt_class_name)
     # Optimization directory has to be prepared - e.g. by duplicating original optimization directory and adding
     # "-restart-1" suffix at the end of the directory name, then (maybe it is necessary - check it) removing directories
@@ -1743,7 +1880,7 @@ if __name__ == '__main__':
     arg_parser.add_argument("-s", "--signature", help="optimization signature - name of subdirectory of ./output")
     # TODO Make this argument available only in plotcmaesoptdata mode
     arg_parser.add_argument("-m", "--modulo", help="Annotate points with particles drawings in first, last and every"
-                                                   "modulo generation. If not given,"
-                                                   "modulo will be automatically adjusted.")
+                                                   " modulo generation. If not given,"
+                                                   " modulo will be automatically adjusted.")
     args = arg_parser.parse_args()
     module_modes[args.mode]()
