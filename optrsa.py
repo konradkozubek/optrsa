@@ -1340,8 +1340,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                             # self.logger.debug(msg=signal_info)
                             # self.logger.debug(msg=signal_name)
                             self.logger.warning(msg=warning_message)
-                            random_seed = "seed" in self.rsa_parameters if self.input_given\
-                                else "seed" in self.all_rsa_parameters
+                            random_seed = self.rsa_parameters.get("seedOrigin") == "random" if self.input_given\
+                                else self.all_rsa_parameters.get("seedOrigin") == "random"
                             # if return_code_name in ["", "TERM"] or (return_code_name == "USR1" and not random_seed):
                             #     self.logger.warning(msg="Resampling phenotype candidate"
                             #                             " no. {}".format(str(candidate_num)))
