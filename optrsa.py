@@ -422,7 +422,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 # Write header line
                 opt_data_file.write("\t".join(self.optimization_data_columns) + "\n")
 
-    # TODO Maybe define __setstate__ method to redirect output after unpickling
     def __getstate__(self):
         """
         Method modifying pickling behaviour of the class' instance.
@@ -791,8 +790,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # self.logger.debug(msg="rsa_processes_stdins:\n{}".format(self.rsa_processes_stdins))
         return return_code
 
-    # TODO Maybe find a way to assign more threads to rsa processes when other processes in generation ended and there
-    #  are unused threads - probably from the next collector on
     # TODO Maybe find a way to pass arguments to optrsa program's process in runtime to change the overall number of
     #  used threads from the next generation on
     def evaluate_generation_parallel_in_pool(self, pheno_candidates: List[np.ndarray],
@@ -881,8 +878,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                       for val in [ind, cand.at["pfrac"], cand.at["pfracstddev"]]]
         generation_data = [str(self.CMAES.countiter),
                            self.arg_to_particle_attributes(self.CMAES.mean),  # " ".join(map(str, self.CMAES.mean))
-                           # TODO Maybe get also standard deviations from self.CMAES.logger or its output file
-                           #  self.cmaes_output_dir + "/stddev.dat" - it should have data when this function is called
                            ",".join(map(str, self.stddevs_to_particle_stddevs(self.stddevs))),
                            str(best_cand.name), best_cand.at["partattrs"],
                            str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
@@ -901,7 +896,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         output_filename = _output_dir + "/" + signature + "/packing-fraction-vs-params.txt"
         mean_output_filename = _output_dir + "/" + signature + "/outcmaes/xmean.dat"
         stddev_output_filename = _output_dir + "/" + signature + "/outcmaes/stddev.dat"
-        # TODO Maybe get also standard deviations from "stddev.dat" file
         opt_data_filename = _output_dir + "/" + signature + "/optimization.dat"
         # Data of the first generation (no. 0) is logged in xmean.dat file, but in some of other CMA-ES output files
         # it is not logged
@@ -1210,54 +1204,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         ax.set_ylim(bottom_lim - bottom_space / (1. - bottom_space) * (top_lim - bottom_lim), top_lim)
         plt.show()
 
-    # TODO Create this decorator properly - probably in an inner class or create a parameterized decorator outside the
-    #  class - see https://medium.com/@vadimpushtaev/decorator-inside-python-class-1e74d23107f6
-    # def redirecting_output(self) -> Callable[[Callable[..., None]], Callable[..., None]]:
-    #     if not self.output_to_file:
-    #         return lambda f: f
-    #
-    #     def redirect_output_decorator(function: Callable[..., None]) -> Callable[..., None]:
-    #         def redirect_output(*args, **kwargs):
-    #             # If self.output_to_file == True, then output will be written to an output file,
-    #             # otherwise to the standard output. See http://www.blog.pythonlibrary.org/2016/06/16/python-101
-    #             # -redirecting-stdout/
-    #             # TODO Maybe use logging module instead, it has useful features.
-    #             #  Output can be written simultaneously to both standard output and a file also when using logging
-    #             #  module. See: https://stackoverflow.com/questions/14906764/how-to-redirect-stdout-to-both-file-and
-    #             #  -console-with-scripting
-    #             stdout = sys.stdout
-    #             stderr = sys.stderr
-    #             with open(self.output_dir + "/" + self.signature + "_output.txt", "w+") as output_file:
-    #                 sys.stdout = output_file
-    #                 sys.stderr = output_file
-    #                 function(*args, **kwargs)
-    #             sys.stdout = stdout
-    #             sys.stderr = stderr
-    #         return redirect_output
-    #     return redirect_output_decorator
-
     @waiting_for_graphs
     def run(self) -> None:
         """Method running optimization"""
-
-        # If self.output_to_file == True, then output will be written to an output file,
-        # otherwise to the standard output. See http://www.blog.pythonlibrary.org/2016/06/16/python-101
-        # -redirecting-stdout/
-        # TODO Maybe use logging module instead, it has useful features.
-        #  Output can be written simultaneously to both standard output and a file also when using logging
-        #  module. See: https://stackoverflow.com/questions/14906764/how-to-redirect-stdout-to-both-file-and
-        #  -console-with-scripting
-        # TODO Other option - use the first solution from the above link
-        # if self.output_to_file:
-        #     stdout = sys.stdout
-        #     stderr = sys.stderr
-        #     # If a decorator for redirecting output were used, a "with" statement could have been used
-        #     # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
-        #     # output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
-        #     output_file = open(self.output_dir + "/optimization-output.txt", "w+")
-        #     sys.stdout = output_file
-        #     sys.stderr = output_file
-        #     # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
 
         self.logger.info(msg="")
         if self.CMAES.countiter == 0:
@@ -1316,7 +1265,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 # TODO Implement computing it in parallel (probably using evaluate_generation_parallel_in_pool method,
                 #  use also a function that for number of simulations and simulation number returns number
                 #  of ompThreads)
-                # TODO If computing in series, assign maximal number of OpenMP threads
                 # TODO Maybe add an option to somehow tell the program to end optimization (e.g. kill -KILL an RSA
                 #  process or send a signal to the main process)
                 take_median = np.full(shape=len(pheno_candidates), fill_value=False)
@@ -1409,8 +1357,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             else:
                 # TODO Implement checking results in serial computing case
                 values = self.evaluate_generation_serial(pheno_candidates)
-            # TODO Check, what happens in case when e.g. None is returned as candidate value, so (I guess)
-            #  a reevaluation is conducted
+            # TODO Check, what happens in case when e.g. None is returned as candidate value
             # TODO Maybe add checking if rsa simulation finished with success and successfully wrote a line to
             #  packing-fraction-vs-params.txt file. If it fails, in serial computing the previous packing fraction
             #  is assigned as the current value in values array without any warning, and in parallel - wrong value
@@ -1446,9 +1393,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         if self.show_graph:
             plot_cmaes_graph_in_background(self.CMAES.logger.name_prefix, self.signature)
 
-        # if self.output_to_file:
-        #     sys.stdout = stdout
-        #     sys.stderr = stderr
         # if self.output_to_file:
         sys.stdout = self.stdout
         sys.stderr = self.stderr
@@ -1586,7 +1530,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 
                 # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)  # Causes a bug in matplotlib
                 # arrow_style = matplotlib.patches.ArrowStyle("->", head_width=0.8)
-                # Head lengths are not scaled and for small standard deviations heads are longer then arrow, so one
+                # Head lengths are not scaled and for small standard deviations heads are longer than arrow, so one
                 # solution is to make them not visible
                 # TODO Make arrows lengths correct while using arrows without heads
                 arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
@@ -1707,7 +1651,7 @@ class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
     """
 
     default_rsa_parameters = dict(PolydiskRSACMAESOpt.default_rsa_parameters,  # super().default_rsa_parameters,
-                                  **{  # "maxVoxels": "4000000",
+                                  **{"maxVoxels": "4000000",
                                      "requestedAngularVoxelSize": "0.3",
                                      "minDx": "0.0",
                                      "from": "0",
@@ -1739,6 +1683,157 @@ class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         return stddevs_with_all_disks
 
 
+class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
+
+    mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters,
+                                     surfaceDimension="2", particleType="Polygon")
+
+    @classmethod
+    @abc.abstractmethod
+    def arg_to_polygon_attributes(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+        """
+        Function returning part of Polygon's particleAttributes in a tuple, which first element is \"xy\" or \"rt\"
+        string indicating type of coordinates and the second is a numpy ndarray with v_01 v_02 v_11 v_22 ... floats
+        (vertices' coordinates)
+        """
+        pass
+
+    @classmethod
+    def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
+        """Function returning rsa3d program's parameter particleAttributes based on arg"""
+        coordinates_type, vertices_params = cls.arg_to_polygon_attributes(arg)
+        vertices_num = vertices_params.size // 2
+        particle_attributes_list = [str(vertices_num), coordinates_type]
+        particle_attributes_list.extend(vertices_params.astype(np.unicode).tolist())
+        particle_attributes_list.append(str(vertices_num))
+        particle_attributes_list.extend(np.arange(vertices_num).astype(np.unicode).tolist())
+        return " ".join(particle_attributes_list)
+
+    @classmethod
+    def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
+        # TODO Implement it
+        pass
+
+
+class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt):
+
+    default_rsa_parameters = dict(PolygonRSACMAESOpt.default_rsa_parameters,  # super().default_rsa_parameters,
+                                  **{"maxVoxels": "4000000",
+                                     "requestedAngularVoxelSize": "0.3",
+                                     "minDx": "0.0",
+                                     "from": "0",
+                                     "collectors": "5",
+                                     "split": "100000",
+                                     "boundaryConditions": "periodic"})
+
+    def get_arg_signature(self) -> str:
+        vertices_num = (self.initial_mean.size - 1) // 2 + 2
+        return "vertices-" + str(vertices_num) + "-initstds-" + str(self.initial_stddevs)
+
+    @classmethod
+    def arg_to_polygon_attributes(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+        arg_with_all_vertices = np.concatenate((arg, np.zeros(3)))
+        return "xy", arg_with_all_vertices
+
+    @classmethod
+    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        stddevs_with_all_vertices = np.concatenate((stddevs, np.zeros(3)))
+        return stddevs_with_all_vertices
+
+
+class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+
+    mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters,
+                                     particleType="RoundedPolygon")
+
+    @classmethod
+    def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
+        """Function returning rsa3d program's parameter particleAttributes based on arg"""
+        polygon_particle_attributes = super().arg_to_particle_attributes(arg)
+        return "1 " + polygon_particle_attributes
+
+    @classmethod
+    def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
+        # Extract particle data
+        # TODO Maybe scale rounded polygons so that they have unitary area
+        particle_attributes_list = particle_attributes.split(" ")
+        part_data = np.array(particle_attributes_list[3:3 + 2 * int(particle_attributes_list[1])],
+                             dtype=np.float).reshape(-1, 2)
+        if part_std_devs is not None:
+            std_devs_data = part_std_devs.reshape(-1, 2)
+        # Draw particle
+        # TODO In case of rounded polygons with more than 3 vertices take convex hull or use an algorithm connecting an
+        #  arbitrary set of points in such a way that a polygon is made (e.g. calculate points' mean, connect points
+        #  counterclockwise relatively to this point, if some points are in the mean point then set them as the first
+        #  points, if some points have the same azimuthal angle, then connect the previous point with the nearer of
+        #  the farthest and the closest (in terms of the radial coordinate) points and connect these points one by one)
+        # Get polygon drawing's width and height
+        if part_std_devs is None:
+            x_min = np.min(part_data[:, 0] - 1.)
+            x_max = np.max(part_data[:, 0] + 1.)
+            y_min = np.min(part_data[:, 1] - 1.)
+            y_max = np.max(part_data[:, 1] + 1.)
+        else:
+            x_min = np.min(np.concatenate((part_data[:, 0] - 1., part_data[:, 0] - std_devs_data[:, 0])))
+            x_max = np.max(np.concatenate((part_data[:, 0] + 1., part_data[:, 0] + std_devs_data[:, 0])))
+            y_min = np.min(np.concatenate((part_data[:, 1] - 1., part_data[:, 1] - std_devs_data[:, 1])))
+            y_max = np.max(np.concatenate((part_data[:, 1] + 1., part_data[:, 1] + std_devs_data[:, 1])))
+        drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * (x_max - x_min),
+                                                        scaling_factor * (y_max - y_min),
+                                                        scaling_factor * -x_min,
+                                                        scaling_factor * -y_min)
+        # TODO Check if the scale of the radius is correct - rather yes
+        # TODO Check why a strange artefact appeared
+        # TODO Make a disk appear if the initial mean is a zero vector
+        polygon = matplotlib.patches.Polygon(scaling_factor * part_data, linewidth=scaling_factor * 2,
+                                             joinstyle="round", capstyle="round", color=color)
+        drawing_area.add_artist(polygon)
+        for vertex_num, vertex_args in enumerate(part_data):
+            if part_std_devs is None:
+                vertex_label = matplotlib.text.Text(x=scaling_factor * vertex_args[0],
+                                                    y=scaling_factor * vertex_args[1],
+                                                    text=str(vertex_num),
+                                                    horizontalalignment="center",
+                                                    verticalalignment="center",
+                                                    fontsize=11)
+                drawing_area.add_artist(vertex_label)
+            else:
+                vertex_label = matplotlib.text.Text(x=scaling_factor * vertex_args[0] + scaling_factor / 2,
+                                                    y=scaling_factor * vertex_args[1] + scaling_factor / 2,
+                                                    text=str(vertex_num),
+                                                    horizontalalignment="center",
+                                                    verticalalignment="center",
+                                                    fontsize=9)
+                drawing_area.add_artist(vertex_label)
+
+                # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)  # Causes a bug in matplotlib
+                # arrow_style = matplotlib.patches.ArrowStyle("->", head_width=0.8)
+                # Head lengths are not scaled and for small standard deviations heads are longer than arrow, so one
+                # solution is to make them not visible
+                # TODO Make arrows lengths correct while using arrows without heads
+                arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
+                center = (scaling_factor * vertex_args[0], scaling_factor * vertex_args[1])
+                ticks = [(center[0] + scaling_factor * std_devs_data[vertex_num][0], center[1]),
+                         (center[0] - scaling_factor * std_devs_data[vertex_num][0], center[1]),
+                         (center[0], center[1] + scaling_factor * std_devs_data[vertex_num][1]),
+                         (center[0], center[1] - scaling_factor * std_devs_data[vertex_num][1])]
+                for tick in ticks:
+                    std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                        center,
+                        tick,
+                        arrowstyle=arrow_style,
+                        shrinkA=0,
+                        shrinkB=0)
+                    drawing_area.add_artist(std_dev_arrow)
+        return drawing_area
+
+
+class ConstrXYFixedRadiiRoundedPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt, ConstrXYPolygonRSACMAESOpt):
+    pass
+
+
 def optimize() -> None:
 
     def opt_fixed_radii() -> None:
@@ -1757,9 +1852,18 @@ def optimize() -> None:
         constr_fixed_radii_polydisk_opt = ConstrFixedRadiiXYPolydiskRSACMAESOpt(**opt_class_args)
         constr_fixed_radii_polydisk_opt.run()
 
+    def opt_constr_fixed_radii_polygon() -> None:
+        initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
+        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedPolygonRSACMAESOpt(**opt_class_args)
+        constr_fixed_radii_polygon_opt.run()
+
     opt_modes = {
         "optfixedradii": opt_fixed_radii,
-        "optconstrfixedradii": opt_constr_fixed_radii
+        "optconstrfixedradii": opt_constr_fixed_radii,
+        "optconstrfixedradiipolygon": opt_constr_fixed_radii_polygon
     }
     if args.file is None:
         raise TypeError("In optimize mode input file has to be specified using -f argument")
@@ -1828,23 +1932,7 @@ def resume_optimization() -> None:
 #  the parameter point (maybe return None immediately after rsa_process.wait() in case of a failure) (old note)
 # TODO Maybe prepare a Makefile like in https://docs.python-guide.org/writing/structure/ and with creating
 #  virtual environment (check how PyCharm creates virtualenvs)
-# TODO Object-oriented implementation of optimization - class RSACMAESOptimization, - partly DONE
-#  maybe class PolydiskRSACMAESOpt(RSACMAESOptimization), - DONE
-#  __init__ arguments: mean, stds, RSAParameters, CMAOptions, other parameters, - DONE (there is no separate cl. RSAP.)
-#  separate setting RSA parameters (kept constant during the whole optimization) from objective_function, - DONE
-#  separate setting particleAttributes from the rest of objective_function (to arg_to_particle_attributes method), -DONE
-#  parallel version of objective_function, find an efficient way to get packing fraction and make a method for this,DONE
-#  change simulation_parameters, evol_strat and other variables to class attributes, - DONE
-#  maybe move input file generation to __init__ - DONE
-#  (in __init__: setting packing signature, creating packing-fraction-vs-params.txt, - DONE
-#  setting (also default) RSAParameters, generating input file, preparing rsa3d process call sequence
-#  (apart from particleAttributes it is constant during the optimization)), - DONE
-#  separate method for running optimization called run (or execute or optimize - the latter one can be confused
-#  with evol_strat.optimize), - DONE
-#  methods for plotting and visualization of the saved data - partly DONE
-#  then program mode with RSAParameters instantiation, calling run method and maybe other actions like plotting graphs
-#  or making wolfram files etc. (Respective methods.) - partly DONE
-#  The objective is to make running, analyzing and modification of optimization comfortable.
+# TODO Maybe other methods for plotting and visualization of the saved data
 # TODO Maybe add a method calling rsa3d program in wolfram mode on specified .bin file
 #  - particleAttributes may be taken from rsa-simulation-input.txt file
 # TODO Adding box constraints based on feasible anisotropy (probably)
