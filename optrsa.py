@@ -340,20 +340,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
 
         # Create list of common arguments (constant during the whole optimization)
         # for running rsa3d program in other process
-        self.rsa_proc_arguments = [_rsa_path, "accuracy"]
-        if self.input_given:
-            # Correct results, but problems with running rsa3d with other command afterwards,
-            # because particleAttributes option was overwritten and input file is wrong
-            # - the same options have to be given
-            self.rsa_proc_arguments.extend(["-f", self.input_filename])
-            self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
-                                            for param_name, param_value in self.rsa_parameters.items()])
-        else:
-            self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
-                                            for param_name, param_value in self.all_rsa_parameters.items()])
-        # Index at which particleAttributes parameter will be inserted
-        self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
-        self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
+        self.set_rsa_proc_arguments()
 
         # Configure and set optimization state logger
         # Logs can be printed to a logfile or to the standard output. By default, logfile will contain log records of
@@ -422,6 +409,24 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 # Write header line
                 opt_data_file.write("\t".join(self.optimization_data_columns) + "\n")
 
+    def set_rsa_proc_arguments(self) -> None:
+        """
+        Create list of common arguments (constant during the whole optimization)
+        for running rsa3d program in other process
+        :return: None
+        """
+        self.rsa_proc_arguments = [_rsa_path, "accuracy"]
+        if self.input_given:
+            self.rsa_proc_arguments.extend(["-f", self.input_filename])
+            self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
+                                            for param_name, param_value in self.rsa_parameters.items()])
+        else:
+            self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
+                                            for param_name, param_value in self.all_rsa_parameters.items()])
+        # Index at which particleAttributes parameter will be inserted
+        self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
+        self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
+
     def __getstate__(self):
         """
         Method modifying pickling behaviour of the class' instance.
@@ -457,7 +462,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         if self.output_to_file:
             # To set handlers' filename, modify configuration dictionary as below, try to set it to a variable in
             # configuration file, use logger's addHandler method or modify logger.handlers[0] (probably it is not
-            # possible to specify file name after handler was instatiated)
+            # possible to specify file name after handler was instantiated)
             logging_configuration["handlers"]["optimization_logfile"]["filename"] = self.output_dir \
                                                                                     + "/optimization-output.log"
         else:
@@ -473,8 +478,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
         sys.stderr = StreamToLogger(logger=self.logger, log_level=logging.ERROR)
 
-    def pickle(self) -> None:
-        with open(self.output_dir + "/_" + self.__class__.__name__ + ".pkl", "wb") as pickle_file:
+    def pickle(self, name: Optional[str] = None) -> None:
+        pickle_name = "" if name is None else "-" + name
+        with open(self.output_dir + "/_" + self.__class__.__name__ + pickle_name + ".pkl", "wb") as pickle_file:
             pickle.dump(self, pickle_file)
 
     # TODO Annotate it correctly
@@ -1387,6 +1393,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.CMAES.result_pretty()
         # Pickling of the object
         self.pickle()
+        termination_condition = "-".join(["{}-{}".format(key, val) for key, val in self.CMAES.result.stop.items()])\
+            .replace(".", "_")
+        self.pickle(name="gen-{}-term-{}".format(self.CMAES.countiter - 1, termination_condition))
 
         # TODO Add separate method for making graphs
         # TODO Maybe create another class for analyzing the results of optimization
@@ -1759,10 +1768,28 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         # Extract particle data
         # TODO Maybe scale rounded polygons so that they have unitary area
         particle_attributes_list = particle_attributes.split(" ")
-        part_data = np.array(particle_attributes_list[3:3 + 2 * int(particle_attributes_list[1])],
+        vertices_num = int(particle_attributes_list[1])
+        part_data = np.array(particle_attributes_list[3:3 + 2 * vertices_num],
                              dtype=np.float).reshape(-1, 2)
+        center_of_mass = np.mean(part_data, axis=0)
+        area = 0.
+        for vert_num in range(vertices_num):
+            prev_vert_num = vert_num - 1 if vert_num > 0 else vertices_num - 1
+            next_vert_num = (vert_num + 1) % vertices_num
+            area += np.abs(np.cross(part_data[vert_num] - center_of_mass,
+                                    part_data[next_vert_num] - center_of_mass)) / 2
+            first_segment_vec = part_data[prev_vert_num] - part_data[vert_num]
+            second_segment_vec = part_data[next_vert_num] - part_data[vert_num]
+            triangle_side_vec = part_data[next_vert_num] - part_data[prev_vert_num]
+            triangle_height = np.abs(np.cross(first_segment_vec, second_segment_vec)) \
+                              / np.linalg.norm(triangle_side_vec)
+            angle = np.arccos(triangle_height / np.linalg.norm(first_segment_vec)) \
+                + np.arccos(triangle_height / np.linalg.norm(second_segment_vec))
+            area += np.linalg.norm(first_segment_vec) + (np.pi - angle) / 2.
+        sqrt_area = np.sqrt(area)
+        part_data /= sqrt_area
         if part_std_devs is not None:
-            std_devs_data = part_std_devs.reshape(-1, 2)
+            std_devs_data = part_std_devs.reshape(-1, 2) / sqrt_area
         # Draw particle
         # TODO In case of rounded polygons with more than 3 vertices take convex hull or use an algorithm connecting an
         #  arbitrary set of points in such a way that a polygon is made (e.g. calculate points' mean, connect points
@@ -1770,16 +1797,17 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         #  points, if some points have the same azimuthal angle, then connect the previous point with the nearer of
         #  the farthest and the closest (in terms of the radial coordinate) points and connect these points one by one)
         # Get polygon drawing's width and height
+        radius = 1. / sqrt_area
         if part_std_devs is None:
-            x_min = np.min(part_data[:, 0] - 1.)
-            x_max = np.max(part_data[:, 0] + 1.)
-            y_min = np.min(part_data[:, 1] - 1.)
-            y_max = np.max(part_data[:, 1] + 1.)
+            x_min = np.min(part_data[:, 0] - radius)
+            x_max = np.max(part_data[:, 0] + radius)
+            y_min = np.min(part_data[:, 1] - radius)
+            y_max = np.max(part_data[:, 1] + radius)
         else:
-            x_min = np.min(np.concatenate((part_data[:, 0] - 1., part_data[:, 0] - std_devs_data[:, 0])))
-            x_max = np.max(np.concatenate((part_data[:, 0] + 1., part_data[:, 0] + std_devs_data[:, 0])))
-            y_min = np.min(np.concatenate((part_data[:, 1] - 1., part_data[:, 1] - std_devs_data[:, 1])))
-            y_max = np.max(np.concatenate((part_data[:, 1] + 1., part_data[:, 1] + std_devs_data[:, 1])))
+            x_min = np.min(np.concatenate((part_data[:, 0] - radius, part_data[:, 0] - std_devs_data[:, 0])))
+            x_max = np.max(np.concatenate((part_data[:, 0] + radius, part_data[:, 0] + std_devs_data[:, 0])))
+            y_min = np.min(np.concatenate((part_data[:, 1] - radius, part_data[:, 1] - std_devs_data[:, 1])))
+            y_max = np.max(np.concatenate((part_data[:, 1] + radius, part_data[:, 1] + std_devs_data[:, 1])))
         drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * (x_max - x_min),
                                                         scaling_factor * (y_max - y_min),
                                                         scaling_factor * -x_min,
@@ -1787,7 +1815,7 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         # TODO Check if the scale of the radius is correct - rather yes
         # TODO Check why a strange artefact appeared
         # TODO Make a disk appear if the initial mean is a zero vector
-        polygon = matplotlib.patches.Polygon(scaling_factor * part_data, linewidth=scaling_factor * 2,
+        polygon = matplotlib.patches.Polygon(scaling_factor * part_data, linewidth=scaling_factor * 2 * radius,
                                              joinstyle="round", capstyle="round", color=color)
         drawing_area.add_artist(polygon)
         for vertex_num, vertex_args in enumerate(part_data):
@@ -1906,24 +1934,52 @@ def resume_optimization() -> None:
     optimization.logger.info(msg="")
     optimization.logger.info(msg="")
     optimization.logger.info(msg="Resuming optimization")
-    # Overwrite CMA-ES options, if the file argument was given. It should contain only the dictionary with CMAOptions
-    # TODO Change this behaviour to accept not only CMA-ES options in input file but also optimization options that can
-    #  be changed, and implement making these changes
+    # Overwrite optimization options, if the file argument was given
     if args.file is not None:
         with open(_input_dir + "/" + args.file, "r") as opt_input_file:
             # TODO Maybe use configparser module or YAML format instead
-            cmaes_options = json.load(opt_input_file)
-        # After unpickling output is redirected to logger, so CMAEvolutionStrategy classes' errors and warnings
-        # as e.g. "UserWarning: key popsize ignored (not recognized as versatile) ..." will be logged
-        optimization.CMAES.opts.set(cmaes_options)
+            resume_input = json.load(opt_input_file)
+        # TODO Test it
+        if "cma_options" in resume_input:
+            # After unpickling output is redirected to logger, so CMAEvolutionStrategy classes' errors and warnings
+            # as e.g. "UserWarning: key popsize ignored (not recognized as versatile) ..." will be logged
+            optimization.CMAES.opts.set(resume_input["cma_options"])
+            # optimization.cma_options is not updated
+        if "rsa_parameters" in resume_input:
+            for param in list(optimization.mode_rsa_parameters) + ["particleAttributes"]:
+                if param in resume_input["rsa_parameters"]:
+                    del resume_input["rsa_parameters"][param]
+                    optimization.logger.warning(msg="Resume RSA parameter {} ignored".format(param))
+            optimization.rsa_parameters.update(resume_input["rsa_parameters"])
+            if not optimization.input_given:
+                optimization.all_rsa_parameters.update(resume_input["rsa_parameters"])
+        for attr in ["accuracy", "parallel", "particle_attributes_parallel"]:
+            if attr in resume_input:
+                setattr(optimization, attr, resume_input[attr])
+        if "threads" in resume_input:
+            optimization.parallel_threads_number = resume_input["threads"]
+            optimization.parallel_simulations_number = min(optimization.parallel_threads_number,
+                                                           optimization.CMAES.popsize)
+        # TODO Set (and maybe check) other attributes, if needed
+        if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) or "accuracy" in resume_input:
+            # All attributes that are used in optimization.rsa_proc_arguments have to be set already, if present
+            optimization.set_rsa_proc_arguments()
         # Generate used optimization input file in output directory
-        resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds")
-        resume_signature += "-optimization-resume-input"
-        resume_signature = resume_signature.replace(":", "-").replace(".", "_")
-        opt_input_filename = optimization.output_dir + "/" + resume_signature + ".json"
+        resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds").replace(":", "-")\
+            .replace(".", "_")
+        resume_signature += "-optimization-resume-gen-{}".format(optimization.CMAES.countiter)
+        opt_input_filename = optimization.output_dir + "/" + resume_signature + "-input.json"
         with open(opt_input_filename, "w+") as opt_input_file:
-            json.dump(cmaes_options, opt_input_file, indent=2)
-        optimization.logger.info(msg="Optimization resume input file: {}.json".format(resume_signature))
+            json.dump(resume_input, opt_input_file, indent=2)
+        optimization.logger.info(msg="Optimization resume input file: {}-input.json".format(resume_signature))
+        if "rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0:
+            rsa_input_filename = optimization.output_dir + "/" + resume_signature + "-rsa-input.txt"
+            with open(rsa_input_filename, "w+") as rsa_input_file:
+                rsa_parameters = optimization.rsa_parameters if optimization.input_given\
+                    else optimization.all_rsa_parameters
+                rsa_input_file.writelines(["{} = {}\n".format(param_name, param_value)
+                                           for param_name, param_value in rsa_parameters.items()])
+            optimization.logger.info(msg="Resume RSA input file: {}-rsa-input.txt".format(resume_signature))
     # Run optimization
     optimization.run()
 
