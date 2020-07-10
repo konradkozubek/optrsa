@@ -22,6 +22,7 @@ import matplotlib.text
 import matplotlib_shiftable_annotation
 
 import numpy as np
+from scipy.spatial import ConvexHull
 
 import argparse
 import json
@@ -506,10 +507,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
         """
-        Function returning particle attributes' standard deviations based on standard deviations
-        in optimization's space
+        Function returning particle attributes' standard deviations based on standard deviations (and possibly mean
+        coordinates) in optimization's space
         """
         pass
 
@@ -884,7 +885,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                       for val in [ind, cand.at["pfrac"], cand.at["pfracstddev"]]]
         generation_data = [str(self.CMAES.countiter),
                            self.arg_to_particle_attributes(self.CMAES.mean),  # " ".join(map(str, self.CMAES.mean))
-                           ",".join(map(str, self.stddevs_to_particle_stddevs(self.stddevs))),
+                           ",".join(map(str, self.stddevs_to_particle_stddevs(self.CMAES.mean, self.stddevs))),
                            str(best_cand.name), best_cand.at["partattrs"],
                            str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
                            str(median_cand.name), median_cand.at["partattrs"],
@@ -927,7 +928,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 generation_data = [str(gen_num),
                                    cls.arg_to_particle_attributes(mean_arg),
                                    # " ".join(map(str, mean_arg))
-                                   ",".join(map(str, cls.stddevs_to_particle_stddevs(stddevs))),
+                                   ",".join(map(str, cls.stddevs_to_particle_stddevs(mean_arg, stddevs))),
                                    str(best_cand.name), best_cand.at["partattrs"],
                                    str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
                                    str(median_cand.name), median_cand.at["partattrs"],
@@ -1648,7 +1649,7 @@ class FixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         return "xy", arg_with_radii
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
         stddevs_with_radii = np.insert(stddevs, np.arange(2, stddevs.size + 1, 2), 0.)
         return stddevs_with_radii
 
@@ -1686,7 +1687,7 @@ class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         return "xy", arg_with_all_disks
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
         stddevs_with_standard_disks_radii = np.insert(stddevs, np.arange(2, stddevs.size, 2), 0.)
         stddevs_with_all_disks = np.concatenate((stddevs_with_standard_disks_radii, np.zeros(5, dtype=np.float)))
         return stddevs_with_all_disks
@@ -1699,24 +1700,50 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def arg_to_polygon_attributes(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
         """
-        Function returning part of Polygon's particleAttributes in a tuple, which first element is \"xy\" or \"rt\"
-        string indicating type of coordinates and the second is a numpy ndarray with v_01 v_02 v_11 v_22 ... floats
-        (vertices' coordinates)
+        Function selecting polygon's vertices from points returned by the arg_to_points_coordinates method. Given
+        a NumPy ndarray of shape (n, 2) with points' coordinates, it returns indices of the subsequent polygon's
+        vertices in a NumPy ndarray of shape (1,) with integers
+        """
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+        """
+        Function returning coordinates of points being candidates for becoming polygon's vertices. First element of the
+        returned tuple is \"xy\" or \"rt\" string indicating type of coordinates and the second is a NumPy ndarray of
+        shape (n, 2) with floats representing points' coordinates
         """
         pass
 
     @classmethod
     def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
         """Function returning rsa3d program's parameter particleAttributes based on arg"""
-        coordinates_type, vertices_params = cls.arg_to_polygon_attributes(arg)
-        vertices_num = vertices_params.size // 2
+        coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
+        vertices = points_coordinates[cls.select_vertices(coordinates_type, points_coordinates)].flatten()
+        vertices_num = vertices.size // 2
         particle_attributes_list = [str(vertices_num), coordinates_type]
-        particle_attributes_list.extend(vertices_params.astype(np.unicode).tolist())
+        particle_attributes_list.extend(vertices.astype(np.unicode).tolist())
         particle_attributes_list.append(str(vertices_num))
         particle_attributes_list.extend(np.arange(vertices_num).astype(np.unicode).tolist())
         return " ".join(particle_attributes_list)
+
+    @classmethod
+    @abc.abstractmethod
+    def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        """
+        Function returning standard deviations of points being candidates for becoming polygon's vertices in a form of
+        a NumPy ndarray of shape (n, 2) with floats representing points' standard deviations
+        """
+        pass
+
+    @classmethod
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
+        points_stddevs = cls.stddevs_to_points_stddevs(stddevs)
+        coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
+        return points_stddevs[cls.select_vertices(coordinates_type, points_coordinates)].flatten()
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
@@ -1725,7 +1752,30 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         pass
 
 
-class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt):
+class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+
+    @classmethod
+    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
+        if coordinates_type != "xy":
+            # ConvexHull constructor requires Cartesian coordinates, so a conversion has to be made
+            conversions = {
+                "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
+            }
+            if coordinates_type in conversions:
+                # TODO Test this conversion
+                points = np.apply_along_axis(conversions[coordinates_type], 0, points)
+            else:
+                raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
+                                          "yet.".format(coordinates_type))
+        if np.all(points == points[0, :]):
+            # Degenerate case of initializing mean of the distribution with a sequence of equal points
+            return np.array([0])
+        # TODO Maybe deal with other degenerate cases
+        convex_hull = ConvexHull(points)
+        return convex_hull.vertices
+
+
+class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     default_rsa_parameters = dict(PolygonRSACMAESOpt.default_rsa_parameters,  # super().default_rsa_parameters,
                                   **{"maxVoxels": "4000000",
@@ -1741,14 +1791,18 @@ class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt):
         return "vertices-" + str(vertices_num) + "-initstds-" + str(self.initial_stddevs)
 
     @classmethod
-    def arg_to_polygon_attributes(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
-        arg_with_all_vertices = np.concatenate((arg, np.zeros(3)))
-        return "xy", arg_with_all_vertices
+    def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+        arg_with_all_coordinates = np.concatenate((arg, np.zeros(3))).reshape(-1, 2)
+        return "xy", arg_with_all_coordinates
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
-        stddevs_with_all_vertices = np.concatenate((stddevs, np.zeros(3)))
-        return stddevs_with_all_vertices
+    def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        stddevs_with_all_coordinates = np.concatenate((stddevs, np.zeros(3))).reshape(-1, 2)
+        return stddevs_with_all_coordinates
+
+
+class ConstrXYConvexPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, ConvexPolygonRSACMAESOpt):
+    pass
 
 
 class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -1771,6 +1825,7 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         vertices_num = int(particle_attributes_list[1])
         part_data = np.array(particle_attributes_list[3:3 + 2 * vertices_num],
                              dtype=np.float).reshape(-1, 2)
+        # Calculate particle area (works only for convex polygons)
         center_of_mass = np.mean(part_data, axis=0)
         area = 0.
         for vert_num in range(vertices_num):
@@ -1818,6 +1873,9 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         polygon = matplotlib.patches.Polygon(scaling_factor * part_data, linewidth=scaling_factor * 2 * radius,
                                              joinstyle="round", capstyle="round", color=color)
         drawing_area.add_artist(polygon)
+        # TODO If the points contained in the interior of the convex hull of the mean particle are to be shown, meanarg
+        #  and stddevs fields have to be added to logging and saving data and the draw_particle method has to be given
+        #  also arg and std_devs arguments
         for vertex_num, vertex_args in enumerate(part_data):
             if part_std_devs is None:
                 vertex_label = matplotlib.text.Text(x=scaling_factor * vertex_args[0],
@@ -1858,7 +1916,8 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         return drawing_area
 
 
-class ConstrXYFixedRadiiRoundedPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt, ConstrXYPolygonRSACMAESOpt):
+class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
+                                                        ConstrXYConvexPolygonRSACMAESOpt):
     pass
 
 
@@ -1880,18 +1939,18 @@ def optimize() -> None:
         constr_fixed_radii_polydisk_opt = ConstrFixedRadiiXYPolydiskRSACMAESOpt(**opt_class_args)
         constr_fixed_radii_polydisk_opt.run()
 
-    def opt_constr_fixed_radii_polygon() -> None:
+    def opt_constr_fixed_radii_convex_polygon() -> None:
         initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
         opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
         opt_class_args["initial_mean"] = initial_mean
         opt_class_args["optimization_input"] = optimization_input
-        constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedPolygonRSACMAESOpt(**opt_class_args)
+        constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(**opt_class_args)
         constr_fixed_radii_polygon_opt.run()
 
     opt_modes = {
         "optfixedradii": opt_fixed_radii,
         "optconstrfixedradii": opt_constr_fixed_radii,
-        "optconstrfixedradiipolygon": opt_constr_fixed_radii_polygon
+        "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon
     }
     if args.file is None:
         raise TypeError("In optimize mode input file has to be specified using -f argument")
@@ -1975,6 +2034,7 @@ def resume_optimization() -> None:
         if "rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0:
             rsa_input_filename = optimization.output_dir + "/" + resume_signature + "-rsa-input.txt"
             with open(rsa_input_filename, "w+") as rsa_input_file:
+                # TODO Maybe use resume_input["rsa_parameters"] instead
                 rsa_parameters = optimization.rsa_parameters if optimization.input_given\
                     else optimization.all_rsa_parameters
                 rsa_input_file.writelines(["{} = {}\n".format(param_name, param_value)
