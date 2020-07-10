@@ -234,7 +234,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     # opt_data_output_filename = "optimization.dat"
 
     optimization_data_columns: dict = {"generationnum": np.int,
+                                       "meanarg": str,
                                        "meanpartattrs": str,
+                                       "stddevs": str,
                                        "partstddevs": str,
                                        "bestind": np.int, "bestpartattrs": str,
                                        "bestpfrac": np.float, "bestpfracstddev": np.float,
@@ -517,6 +519,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     @classmethod
     @abc.abstractmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
                       part_std_devs: Optional[np.ndarray] = None)\
             -> matplotlib.offsetbox.DrawingArea:
         """
@@ -526,7 +529,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :param particle_attributes: Particle's particleAttributes rsa3d program's parameter string
         :param scaling_factor: Factor for scaling objects drawn on matplotlib.offsetbox.DrawingArea
         :param color: Particle's color specified by matplotlib's color string
-        :param part_std_devs: Particle attributes' standard deviations - they can be given in order to show them on the
+        :param arg: Argument point describing the particle - may be given if it is needed to draw the particle with full
+                    information
+        :param std_devs: Standard deviations of the probability distribution - may be given if it is needed to draw the
+                         particle corresponding to the mean of the probability distribution
+        :param part_std_devs: Particle attributes' standard deviations - they may be given in order to show them on the
                               drawing of the particle corresponding to the mean of the probability distribution
         :return: matplotlib.offsetbox.DrawingArea object with drawn particle
         """
@@ -884,7 +891,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         candidates = [val for ind, cand in func_values_data.iterrows()
                       for val in [ind, cand.at["pfrac"], cand.at["pfracstddev"]]]
         generation_data = [str(self.CMAES.countiter),
+                           ",".join(map(str, self.CMAES.mean)),
                            self.arg_to_particle_attributes(self.CMAES.mean),  # " ".join(map(str, self.CMAES.mean))
+                           ",".join(map(str, self.stddevs)),
                            ",".join(map(str, self.stddevs_to_particle_stddevs(self.CMAES.mean, self.stddevs))),
                            str(best_cand.name), best_cand.at["partattrs"],
                            str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
@@ -926,8 +935,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 candidates = [val for ind, cand in func_values_data.iterrows()
                               for val in [ind, cand.at["pfrac"], cand.at["pfracstddev"]]]
                 generation_data = [str(gen_num),
+                                   ",".join(map(str, mean_arg)),
                                    cls.arg_to_particle_attributes(mean_arg),
-                                   # " ".join(map(str, mean_arg))
+                                   ",".join(map(str, stddevs)),
                                    ",".join(map(str, cls.stddevs_to_particle_stddevs(mean_arg, stddevs))),
                                    str(best_cand.name), best_cand.at["partattrs"],
                                    str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
@@ -1104,6 +1114,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 part_attrs = optimization_data[part_attrs_col].at[gen_num]
                 # Get particle drawing and set properties of the arrow
                 if not means:
+                    # TODO In order to be able to draw all particles with full information about optimization process,
+                    #  phenotype candidates have to be somehow saved (currently they are only written to the logfile and
+                    #  saved in the optimization object in the dictionary optimization.CMAES.archive) and given here in
+                    #  the arg parameter to the draw_particle method. It is needed e.g. to draw the correct numbers of
+                    #  convex polygon's vertices in the optimization space.
                     drawing_area = cls.draw_particle(particle_attributes=part_attrs,
                                                      scaling_factor=scaling_factor,
                                                      color=color)
@@ -1115,10 +1130,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                        connectionstyle="arc3,"
                                                        "rad=0.3")
                 else:
+                    mean_arg = np.array(optimization_data["meanarg"].at[gen_num].split(","), dtype=np.float)
+                    stddevs = np.array(optimization_data["stddevs"].at[gen_num].split(","), dtype=np.float)
                     part_stddevs = np.array(optimization_data["partstddevs"].at[gen_num].split(","), dtype=np.float)
                     drawing_area = cls.draw_particle(particle_attributes=part_attrs,
                                                      scaling_factor=scaling_factor,
                                                      color=color,
+                                                     arg=mean_arg,
+                                                     std_devs=stddevs,
                                                      part_std_devs=part_stddevs)
                     arrow_props = dict()
                 # Set coordinates and positions of the annotated point and the label with drawing
@@ -1470,6 +1489,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
                       part_std_devs: Optional[np.ndarray] = None)\
             -> matplotlib.offsetbox.DrawingArea:
         # Extract particle data
@@ -1747,6 +1767,7 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
                       part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
         # TODO Implement it
         pass
@@ -1769,10 +1790,17 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                           "yet.".format(coordinates_type))
         if np.all(points == points[0, :]):
             # Degenerate case of initializing mean of the distribution with a sequence of equal points
+            # TODO Check, if this is the right thing to do
             return np.array([0])
         # TODO Maybe deal with other degenerate cases
         convex_hull = ConvexHull(points)
         return convex_hull.vertices
+# TODO Make another class for star-shaped polygons, using a following algorithm of polygonization:
+#  1. Calculate points' mean
+#  2. Connect points counterclockwise relatively to this point;
+#     if some points are in the mean point then set them as the first points,
+#     if some points have the same azimuthal angle, then connect the previous point with the nearer of the farthest and
+#     the closest (in terms of the radial coordinate) points and connect these points one by one
 
 
 class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -1818,13 +1846,56 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
+                      arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
                       part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
         # Extract particle data
-        # TODO Maybe scale rounded polygons so that they have unitary area
         particle_attributes_list = particle_attributes.split(" ")
         vertices_num = int(particle_attributes_list[1])
+        coordinates_type = particle_attributes_list[2]
         part_data = np.array(particle_attributes_list[3:3 + 2 * vertices_num],
                              dtype=np.float).reshape(-1, 2)
+        if coordinates_type != "xy":
+            conversions = {
+                "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
+            }
+            if coordinates_type in conversions:
+                # TODO Test this conversion
+                part_data = np.apply_along_axis(conversions[coordinates_type], 0, part_data)
+            else:
+                raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
+                                          "yet.".format(coordinates_type))
+        if np.all(part_data == part_data[0, :]):
+            # Degenerate case of initializing mean of the distribution with a sequence of equal points
+            sqrt_area = np.sqrt(np.pi)
+            disk_center = part_data[0, :] / sqrt_area
+            radius = 1. / sqrt_area
+            drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * 2 * radius,
+                                                            scaling_factor * 2 * radius,
+                                                            scaling_factor * -(disk_center[0] - radius),
+                                                            scaling_factor * -(disk_center[1] - radius))
+            disk = matplotlib.patches.Circle((scaling_factor * disk_center[0], scaling_factor * disk_center[1]),
+                                             scaling_factor * radius,
+                                             color=color)
+            drawing_area.add_artist(disk)
+            if part_std_devs is not None:
+                points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
+                points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
+                arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
+                center = (scaling_factor * disk_center[0], scaling_factor * disk_center[1])
+                for point_num in range(len(points_std_devs_data)):
+                    ticks = [(center[0] + scaling_factor * points_std_devs_data[point_num][0], center[1]),
+                             (center[0] - scaling_factor * points_std_devs_data[point_num][0], center[1]),
+                             (center[0], center[1] + scaling_factor * points_std_devs_data[point_num][1]),
+                             (center[0], center[1] - scaling_factor * points_std_devs_data[point_num][1])]
+                    for tick in ticks:
+                        std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                            center,
+                            tick,
+                            arrowstyle=arrow_style,
+                            shrinkA=0,
+                            shrinkB=0)
+                        drawing_area.add_artist(std_dev_arrow)
+            return drawing_area
         # Calculate particle area (works only for convex polygons)
         center_of_mass = np.mean(part_data, axis=0)
         area = 0.
@@ -1837,32 +1908,43 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
             second_segment_vec = part_data[next_vert_num] - part_data[vert_num]
             triangle_side_vec = part_data[next_vert_num] - part_data[prev_vert_num]
             triangle_height = np.abs(np.cross(first_segment_vec, second_segment_vec)) \
-                              / np.linalg.norm(triangle_side_vec)
+                / np.linalg.norm(triangle_side_vec)
             angle = np.arccos(triangle_height / np.linalg.norm(first_segment_vec)) \
                 + np.arccos(triangle_height / np.linalg.norm(second_segment_vec))
             area += np.linalg.norm(first_segment_vec) + (np.pi - angle) / 2.
         sqrt_area = np.sqrt(area)
         part_data /= sqrt_area
         if part_std_devs is not None:
-            std_devs_data = part_std_devs.reshape(-1, 2) / sqrt_area
+            coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
+            # coordinates_type is overwritten, although it should be the same
+            if coordinates_type != "xy":
+                conversions = {
+                    "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
+                }
+                if coordinates_type in conversions:
+                    # TODO Test this conversion
+                    points_coordinates = np.apply_along_axis(conversions[coordinates_type], 0, points_coordinates)
+                else:
+                    raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not"
+                                              "implemented yet.".format(coordinates_type))
+            points_data = points_coordinates.reshape(-1, 2) / sqrt_area
+            points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
+            points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
+            # std_devs_data = part_std_devs.reshape(-1, 2) / sqrt_area
         # Draw particle
-        # TODO In case of rounded polygons with more than 3 vertices take convex hull or use an algorithm connecting an
-        #  arbitrary set of points in such a way that a polygon is made (e.g. calculate points' mean, connect points
-        #  counterclockwise relatively to this point, if some points are in the mean point then set them as the first
-        #  points, if some points have the same azimuthal angle, then connect the previous point with the nearer of
-        #  the farthest and the closest (in terms of the radial coordinate) points and connect these points one by one)
         # Get polygon drawing's width and height
         radius = 1. / sqrt_area
         if part_std_devs is None:
+            # TODO Maybe change this calculations to use points data, if it is given
             x_min = np.min(part_data[:, 0] - radius)
             x_max = np.max(part_data[:, 0] + radius)
             y_min = np.min(part_data[:, 1] - radius)
             y_max = np.max(part_data[:, 1] + radius)
         else:
-            x_min = np.min(np.concatenate((part_data[:, 0] - radius, part_data[:, 0] - std_devs_data[:, 0])))
-            x_max = np.max(np.concatenate((part_data[:, 0] + radius, part_data[:, 0] + std_devs_data[:, 0])))
-            y_min = np.min(np.concatenate((part_data[:, 1] - radius, part_data[:, 1] - std_devs_data[:, 1])))
-            y_max = np.max(np.concatenate((part_data[:, 1] + radius, part_data[:, 1] + std_devs_data[:, 1])))
+            x_min = np.min(np.concatenate((points_data[:, 0] - radius, points_data[:, 0] - points_std_devs_data[:, 0])))
+            x_max = np.max(np.concatenate((points_data[:, 0] + radius, points_data[:, 0] + points_std_devs_data[:, 0])))
+            y_min = np.min(np.concatenate((points_data[:, 1] - radius, points_data[:, 1] - points_std_devs_data[:, 1])))
+            y_max = np.max(np.concatenate((points_data[:, 1] + radius, points_data[:, 1] + points_std_devs_data[:, 1])))
         drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * (x_max - x_min),
                                                         scaling_factor * (y_max - y_min),
                                                         scaling_factor * -x_min,
@@ -1873,11 +1955,9 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         polygon = matplotlib.patches.Polygon(scaling_factor * part_data, linewidth=scaling_factor * 2 * radius,
                                              joinstyle="round", capstyle="round", color=color)
         drawing_area.add_artist(polygon)
-        # TODO If the points contained in the interior of the convex hull of the mean particle are to be shown, meanarg
-        #  and stddevs fields have to be added to logging and saving data and the draw_particle method has to be given
-        #  also arg and std_devs arguments
-        for vertex_num, vertex_args in enumerate(part_data):
-            if part_std_devs is None:
+        if part_std_devs is None:
+            # TODO Maybe draw all of the points, if they are given
+            for vertex_num, vertex_args in enumerate(part_data):
                 vertex_label = matplotlib.text.Text(x=scaling_factor * vertex_args[0],
                                                     y=scaling_factor * vertex_args[1],
                                                     text=str(vertex_num),
@@ -1885,14 +1965,17 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                                                     verticalalignment="center",
                                                     fontsize=11)
                 drawing_area.add_artist(vertex_label)
-            else:
-                vertex_label = matplotlib.text.Text(x=scaling_factor * vertex_args[0] + scaling_factor / 2,
-                                                    y=scaling_factor * vertex_args[1] + scaling_factor / 2,
-                                                    text=str(vertex_num),
-                                                    horizontalalignment="center",
-                                                    verticalalignment="center",
-                                                    fontsize=9)
-                drawing_area.add_artist(vertex_label)
+        else:
+            for point_num, point_args in enumerate(points_data):
+                point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
+                                                   y=scaling_factor * point_args[1] + scaling_factor / 10,
+                                                   text=str(point_num),
+                                                   horizontalalignment="center",
+                                                   verticalalignment="center",
+                                                   fontsize=9)
+                drawing_area.add_artist(point_label)
+                # TODO Maybe add dots marking the positions of the points, especially the point(s) with 0 standard
+                #  deviations
 
                 # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)  # Causes a bug in matplotlib
                 # arrow_style = matplotlib.patches.ArrowStyle("->", head_width=0.8)
@@ -1900,11 +1983,11 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                 # solution is to make them not visible
                 # TODO Make arrows lengths correct while using arrows without heads
                 arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
-                center = (scaling_factor * vertex_args[0], scaling_factor * vertex_args[1])
-                ticks = [(center[0] + scaling_factor * std_devs_data[vertex_num][0], center[1]),
-                         (center[0] - scaling_factor * std_devs_data[vertex_num][0], center[1]),
-                         (center[0], center[1] + scaling_factor * std_devs_data[vertex_num][1]),
-                         (center[0], center[1] - scaling_factor * std_devs_data[vertex_num][1])]
+                center = (scaling_factor * point_args[0], scaling_factor * point_args[1])
+                ticks = [(center[0] + scaling_factor * points_std_devs_data[point_num][0], center[1]),
+                         (center[0] - scaling_factor * points_std_devs_data[point_num][0], center[1]),
+                         (center[0], center[1] + scaling_factor * points_std_devs_data[point_num][1]),
+                         (center[0], center[1] - scaling_factor * points_std_devs_data[point_num][1])]
                 for tick in ticks:
                     std_dev_arrow = matplotlib.patches.FancyArrowPatch(
                         center,
