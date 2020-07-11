@@ -238,11 +238,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                        "meanpartattrs": str,
                                        "stddevs": str,
                                        "partstddevs": str,
-                                       "bestind": np.int, "bestpartattrs": str,
+                                       "bestind": np.int, "bestarg": str, "bestpartattrs": str,
                                        "bestpfrac": np.float, "bestpfracstddev": np.float,
-                                       "medianind": np.int, "medianpartattrs": str,
+                                       "medianind": np.int, "medianarg": str, "medianpartattrs": str,
                                        "medianpfrac": np.float, "medianpfracstddev": np.float,
-                                       "worstind": np.int, "worstpartattrs": str,
+                                       "worstind": np.int, "worstarg": str, "worstpartattrs": str,
                                        "worstpfrac": np.float, "worstpfracstddev": np.float,
                                        "candidatesdata": str}
 
@@ -580,14 +580,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # TODO Maybe add setting ompThreads option in case of parallel computation (otherwise specify it explicitly),
         #  maybe calculate ompThreads based on self.CMAES.popsize and number of CPU cores obtained using
         #  multiprocessing module - DONE in rsa_simulation method
-        simulation_labels = ",".join([str(self.CMAES.countiter), str(self.candidate_num), str(self.simulations_num)])
+        simulation_labels = ",".join([str(self.CMAES.countiter), str(self.candidate_num), str(self.simulations_num),
+                                      " ".join(map(str, arg))])
         rsa_proc_arguments.append(simulation_labels)
         self.simulations_num += 1
         # TODO In case of reevaluation (UH-CMA-ES), simulation_labels will have to identify the evaluation correctly
         #  (self.simulations_num should be fine to ensure distinction)
         # Create subdirectory for output of rsa3d program in this simulation.
         # simulation_labels contain generation number, candidate number and evaluation number.
-        simulation_output_dir = self.rsa_output_dir + "/" + simulation_labels.replace(",", "_")
+        simulation_output_dir = self.rsa_output_dir + "/" + "_".join(simulation_labels.split(",")[:3])
         if not os.path.exists(simulation_output_dir):
             os.makedirs(simulation_output_dir)
         # Maybe use shutil instead
@@ -721,7 +722,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # Maybe use candidate_num instead of simulation_num to label rsa3d processes' stdins
         if self.parallel:
             simulation_num = self.simulations_num
-        simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num), str(self.simulations_num)])
+        simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num), str(self.simulations_num),
+                                      " ".join(map(str, arg))])
         # Earlier: str(self.simulations_num), str(self.CMAES.countevals), str(self.CMAES.countiter), str(candidate_num)
         # - self.CMAES.countevals value is updated of course only after the end of each generation.
         # self.simulations_num is the number ordering the beginning of simulation, the position of data in
@@ -734,7 +736,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #  (self.simulations_num should be fine to ensure distinction)
         # Create subdirectory for output of rsa3d program in this simulation.
         # simulation_labels contain generation number, candidate number and evaluation number.
-        simulation_output_dir = self.rsa_output_dir + "/" + simulation_labels.replace(",", "_")
+        simulation_output_dir = self.rsa_output_dir + "/" + "_".join(simulation_labels.split(",")[:3])
         if not os.path.exists(simulation_output_dir):
             os.makedirs(simulation_output_dir)
             # Maybe use shutil instead
@@ -755,7 +757,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {},"
                                      " PID: {}, ompThreads: {}\n"
                                      "Argument: {}\n"
-                                     "particleAttributes: {}".format(*simulation_labels.split(","),
+                                     "particleAttributes: {}".format(*simulation_labels.split(",")[:3],
                                                                      pid,
                                                                      omp_threads_attribute,
                                                                      pprint.pformat(arg),
@@ -793,7 +795,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
         self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}, PID: {}."
                              " Time: {}, collectors: {}, return code: {}"
-                             "{}".format(*simulation_labels.split(","),
+                             "{}".format(*simulation_labels.split(",")[:3],
                                          pid,
                                          str(sim_end_time - sim_start_time),
                                          str(collectors_num),
@@ -863,7 +865,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         return list(values), return_codes
 
     def log_generation_data(self) -> None:
-        func_data = pd.DataFrame(columns=["partattrs", "pfrac", "pfracstddev"])
+        func_data = pd.DataFrame(columns=["arg", "partattrs", "pfrac", "pfracstddev"])
         with open(self.output_filename) as output_file:
             # TODO Maybe find more efficient or elegant solution
             # TODO Maybe iterate through lines in file in reversed order - results of the current generation should be
@@ -880,7 +882,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     # values from the last such line will be used
                     # func_data[candidate_num] = [evaluation_data[4],
                     # float(evaluation_data[1]), float(evaluation_data[2])]
-                    func_data.loc[candidate_num] = [evaluation_data[4],
+                    func_data.loc[candidate_num] = [evaluation_labels[3],
+                                                    evaluation_data[4],
                                                     float(evaluation_data[1]),
                                                     float(evaluation_data[2])]
         func_data.sort_values(by="pfrac", ascending=False, inplace=True)
@@ -891,15 +894,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         candidates = [val for ind, cand in func_values_data.iterrows()
                       for val in [ind, cand.at["pfrac"], cand.at["pfracstddev"]]]
         generation_data = [str(self.CMAES.countiter),
-                           ",".join(map(str, self.CMAES.mean)),
+                           " ".join(map(str, self.CMAES.mean)),
                            self.arg_to_particle_attributes(self.CMAES.mean),  # " ".join(map(str, self.CMAES.mean))
-                           ",".join(map(str, self.stddevs)),
-                           ",".join(map(str, self.stddevs_to_particle_stddevs(self.CMAES.mean, self.stddevs))),
-                           str(best_cand.name), best_cand.at["partattrs"],
+                           " ".join(map(str, self.stddevs)),
+                           " ".join(map(str, self.stddevs_to_particle_stddevs(self.CMAES.mean, self.stddevs))),
+                           str(best_cand.name), best_cand.at["arg"], best_cand.at["partattrs"],
                            str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
-                           str(median_cand.name), median_cand.at["partattrs"],
+                           str(median_cand.name), median_cand.at["arg"], median_cand.at["partattrs"],
                            str(median_cand.at["pfrac"]), str(median_cand.at["pfracstddev"]),
-                           str(worst_cand.name), worst_cand.at["partattrs"],
+                           str(worst_cand.name), worst_cand.at["arg"], worst_cand.at["partattrs"],
                            str(worst_cand.at["pfrac"]), str(worst_cand.at["pfracstddev"]),
                            ",".join(map(str, candidates))]
         # Candidates' data is joined with "," rather than printed as separate fields separated by "\t", as below:
@@ -917,11 +920,18 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # it is not logged
         generations_mean_data = np.loadtxt(fname=mean_output_filename, comments=['%', '#'])
         generations_stddev_data = np.loadtxt(fname=stddev_output_filename, comments=['%', '#'])
+        # For backwards compatibility, check if arg field is present in the labels in RSA output file and if not, do not
+        # save arg fields
+        with open(output_filename) as output_file:
+            line = output_file.readline()
+            evaluation_data = line.rstrip("\n").split("\t")
+            evaluation_labels = evaluation_data[0].split(",")
+            old_format = len(evaluation_labels) < 4
         with open(output_filename) as output_file, open(opt_data_filename, "w+") as opt_data_file:
             # Write header line
             opt_data_file.write("\t".join(cls.optimization_data_columns) + "\n")
             gen_num = 0
-            func_data = pd.DataFrame(columns=["partattrs", "pfrac", "pfracstddev"])
+            func_data = pd.DataFrame(columns=["arg", "partattrs", "pfrac", "pfracstddev"])
             # TODO Maybe find more efficient or elegant solution
 
             def save_generation_data() -> None:
@@ -935,15 +945,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 candidates = [val for ind, cand in func_values_data.iterrows()
                               for val in [ind, cand.at["pfrac"], cand.at["pfracstddev"]]]
                 generation_data = [str(gen_num),
-                                   ",".join(map(str, mean_arg)),
+                                   " ".join(map(str, mean_arg)),
                                    cls.arg_to_particle_attributes(mean_arg),
-                                   ",".join(map(str, stddevs)),
-                                   ",".join(map(str, cls.stddevs_to_particle_stddevs(mean_arg, stddevs))),
-                                   str(best_cand.name), best_cand.at["partattrs"],
+                                   " ".join(map(str, stddevs)),
+                                   " ".join(map(str, cls.stddevs_to_particle_stddevs(mean_arg, stddevs))),
+                                   str(best_cand.name), best_cand.at["arg"], best_cand.at["partattrs"],
                                    str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
-                                   str(median_cand.name), median_cand.at["partattrs"],
+                                   str(median_cand.name), median_cand.at["arg"], median_cand.at["partattrs"],
                                    str(median_cand.at["pfrac"]), str(median_cand.at["pfracstddev"]),
-                                   str(worst_cand.name), worst_cand.at["partattrs"],
+                                   str(worst_cand.name), worst_cand.at["arg"], worst_cand.at["partattrs"],
                                    str(worst_cand.at["pfrac"]), str(worst_cand.at["pfracstddev"]),
                                    ",".join(map(str, candidates))]
                 # Candidates' data is joined with "," rather than printed as separate fields separated by "\t",
@@ -958,11 +968,12 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     save_generation_data()
                     gen_num += 1
                     del func_data
-                    func_data = pd.DataFrame(columns=["partattrs", "pfrac", "pfracstddev"])
+                    func_data = pd.DataFrame(columns=["arg", "partattrs", "pfrac", "pfracstddev"])
                 candidate_num = int(evaluation_labels[1])
                 # If multiple lines in packing-fraction-vs-params.txt file correspond to the same candidate, the
                 # values from the last such line will be used
-                func_data.loc[candidate_num] = [evaluation_data[4],
+                func_data.loc[candidate_num] = [evaluation_labels[3] if not old_format else "None",
+                                                evaluation_data[4],
                                                 float(evaluation_data[1]),
                                                 float(evaluation_data[2])]
             # Save last generation's data
@@ -1112,16 +1123,22 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 gen_nums.append(data_len - 1)
             for gen_num in gen_nums:
                 part_attrs = optimization_data[part_attrs_col].at[gen_num]
+                arg_col = part_attrs_col[:-9] + "arg"
+                # For backwards compatibility, check if the arg_col field contains None
+                arg_field = optimization_data[arg_col].at[gen_num]
+                arg = np.array(arg_field.split(" "), dtype=np.float) if arg_field != "None" else None
+                # In order to be able to draw all types of particles with full information about optimization process,
+                # phenotype candidates have to be given here in the arg parameter to the draw_particle method. Therefore
+                # phenotype candidates have to be somehow saved (currently they are written as the fourth label in the
+                # RSA output file, but before they were only written to the logfile and saved in the optimization object
+                # in the dictionary optimization.CMAES.archive). It is needed e.g. to draw the correct numbers of convex
+                # polygon's vertices in the optimization space.
                 # Get particle drawing and set properties of the arrow
                 if not means:
-                    # TODO In order to be able to draw all particles with full information about optimization process,
-                    #  phenotype candidates have to be somehow saved (currently they are only written to the logfile and
-                    #  saved in the optimization object in the dictionary optimization.CMAES.archive) and given here in
-                    #  the arg parameter to the draw_particle method. It is needed e.g. to draw the correct numbers of
-                    #  convex polygon's vertices in the optimization space.
                     drawing_area = cls.draw_particle(particle_attributes=part_attrs,
                                                      scaling_factor=scaling_factor,
-                                                     color=color)
+                                                     color=color,
+                                                     arg=arg)
                     arrow_props = dict(arrowstyle="simple,"  # "->", "simple"
                                                   "head_length=0.2,"
                                                   "head_width=0.3,"  # 0.1, 0.5
@@ -1130,13 +1147,12 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                        connectionstyle="arc3,"
                                                        "rad=0.3")
                 else:
-                    mean_arg = np.array(optimization_data["meanarg"].at[gen_num].split(","), dtype=np.float)
-                    stddevs = np.array(optimization_data["stddevs"].at[gen_num].split(","), dtype=np.float)
-                    part_stddevs = np.array(optimization_data["partstddevs"].at[gen_num].split(","), dtype=np.float)
+                    stddevs = np.array(optimization_data["stddevs"].at[gen_num].split(" "), dtype=np.float)
+                    part_stddevs = np.array(optimization_data["partstddevs"].at[gen_num].split(" "), dtype=np.float)
                     drawing_area = cls.draw_particle(particle_attributes=part_attrs,
                                                      scaling_factor=scaling_factor,
                                                      color=color,
-                                                     arg=mean_arg,
+                                                     arg=arg,
                                                      std_devs=stddevs,
                                                      part_std_devs=part_stddevs)
                     arrow_props = dict()
@@ -1869,17 +1885,25 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
             sqrt_area = np.sqrt(np.pi)
             disk_center = part_data[0, :] / sqrt_area
             radius = 1. / sqrt_area
-            drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * 2 * radius,
-                                                            scaling_factor * 2 * radius,
-                                                            scaling_factor * -(disk_center[0] - radius),
-                                                            scaling_factor * -(disk_center[1] - radius))
+            if part_std_devs is None:
+                drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * 2 * radius,
+                                                                scaling_factor * 2 * radius,
+                                                                scaling_factor * -(disk_center[0] - radius),
+                                                                scaling_factor * -(disk_center[1] - radius))
+            else:
+                points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
+                points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
+                max_x = np.max(np.append(points_std_devs_data[:, 0], radius))
+                max_y = np.max(np.append(points_std_devs_data[:, 1], radius))
+                drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * 2 * max_x,
+                                                                scaling_factor * 2 * max_y,
+                                                                scaling_factor * -(disk_center[0] - max_x),
+                                                                scaling_factor * -(disk_center[1] - max_y))
             disk = matplotlib.patches.Circle((scaling_factor * disk_center[0], scaling_factor * disk_center[1]),
                                              scaling_factor * radius,
                                              color=color)
             drawing_area.add_artist(disk)
             if part_std_devs is not None:
-                points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
-                points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
                 arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
                 center = (scaling_factor * disk_center[0], scaling_factor * disk_center[1])
                 for point_num in range(len(points_std_devs_data)):
@@ -1914,7 +1938,7 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
             area += np.linalg.norm(first_segment_vec) + (np.pi - angle) / 2.
         sqrt_area = np.sqrt(area)
         part_data /= sqrt_area
-        if part_std_devs is not None:
+        if arg is not None:
             coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
             # coordinates_type is overwritten, although it should be the same
             if coordinates_type != "xy":
@@ -1928,6 +1952,7 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                     raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not"
                                               "implemented yet.".format(coordinates_type))
             points_data = points_coordinates.reshape(-1, 2) / sqrt_area
+        if part_std_devs is not None:
             points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
             points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
             # std_devs_data = part_std_devs.reshape(-1, 2) / sqrt_area
@@ -1935,12 +1960,13 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         # Get polygon drawing's width and height
         radius = 1. / sqrt_area
         if part_std_devs is None:
-            # TODO Maybe change this calculations to use points data, if it is given
-            x_min = np.min(part_data[:, 0] - radius)
-            x_max = np.max(part_data[:, 0] + radius)
-            y_min = np.min(part_data[:, 1] - radius)
-            y_max = np.max(part_data[:, 1] + radius)
+            shown_points_data = points_data if arg is not None else part_data
+            x_min = np.min(shown_points_data[:, 0] - radius)
+            x_max = np.max(shown_points_data[:, 0] + radius)
+            y_min = np.min(shown_points_data[:, 1] - radius)
+            y_max = np.max(shown_points_data[:, 1] + radius)
         else:
+            # If part_std_devs are given, arg and std_devs should also be given
             x_min = np.min(np.concatenate((points_data[:, 0] - radius, points_data[:, 0] - points_std_devs_data[:, 0])))
             x_max = np.max(np.concatenate((points_data[:, 0] + radius, points_data[:, 0] + points_std_devs_data[:, 0])))
             y_min = np.min(np.concatenate((points_data[:, 1] - radius, points_data[:, 1] - points_std_devs_data[:, 1])))
@@ -1951,20 +1977,20 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                                                         scaling_factor * -y_min)
         # TODO Check if the scale of the radius is correct - rather yes
         # TODO Check why a strange artefact appeared
-        # TODO Make a disk appear if the initial mean is a zero vector
         polygon = matplotlib.patches.Polygon(scaling_factor * part_data, linewidth=scaling_factor * 2 * radius,
                                              joinstyle="round", capstyle="round", color=color)
         drawing_area.add_artist(polygon)
         if part_std_devs is None:
-            # TODO Maybe draw all of the points, if they are given
-            for vertex_num, vertex_args in enumerate(part_data):
-                vertex_label = matplotlib.text.Text(x=scaling_factor * vertex_args[0],
-                                                    y=scaling_factor * vertex_args[1],
-                                                    text=str(vertex_num),
-                                                    horizontalalignment="center",
-                                                    verticalalignment="center",
-                                                    fontsize=11)
-                drawing_area.add_artist(vertex_label)
+            for point_num, point_args in enumerate(shown_points_data):
+                is_vertex = np.any([np.allclose(point_args, vertex_args) for vertex_args in part_data])
+                point_label = matplotlib.text.Text(x=scaling_factor * point_args[0],
+                                                   y=scaling_factor * point_args[1],
+                                                   text=str(point_num),
+                                                   horizontalalignment="center",
+                                                   verticalalignment="center",
+                                                   fontsize=11 if is_vertex else 9,
+                                                   fontweight="normal" if is_vertex else "bold")
+                drawing_area.add_artist(point_label)
         else:
             for point_num, point_args in enumerate(points_data):
                 point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
