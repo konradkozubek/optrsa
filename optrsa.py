@@ -19,10 +19,11 @@ import matplotlib.transforms
 import matplotlib.offsetbox
 import matplotlib.patches
 import matplotlib.text
-import matplotlib_shiftable_annotation
+# import matplotlib_shiftable_annotation
 
 import numpy as np
 from scipy.spatial import ConvexHull
+import shapely.geometry
 
 import argparse
 import json
@@ -1800,7 +1801,7 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
             }
             if coordinates_type in conversions:
                 # TODO Test this conversion
-                points = np.apply_along_axis(conversions[coordinates_type], 0, points)
+                points = np.apply_along_axis(func1d=conversions[coordinates_type], axis=1, arr=points)
             else:
                 raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
                                           "yet.".format(coordinates_type))
@@ -1811,12 +1812,150 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
         # TODO Maybe deal with other degenerate cases
         convex_hull = ConvexHull(points)
         return convex_hull.vertices
-# TODO Make another class for star-shaped polygons, using a following algorithm of polygonization:
-#  1. Calculate points' mean
-#  2. Connect points counterclockwise relatively to this point;
-#     if some points are in the mean point then set them as the first points,
-#     if some points have the same azimuthal angle, then connect the previous point with the nearer of the farthest and
-#     the closest (in terms of the radial coordinate) points and connect these points one by one
+
+
+class StarShapedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+
+    @classmethod
+    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
+        points = np.copy(points)  # NumPy arrays are passed by reference, so this prevents modifying passed object
+        if coordinates_type != "xy":
+            # Polygonization algorithm converts coordinates to radial with respect to the mean (center of weight) of the
+            # points. A conversion is made to make calculations simple. In case of the radial coordinates ("rt"), the
+            # center point may be used as the reference, but then it might happen that it is placed outside the convex
+            # hull of the points, so the polygonization algorithm would not work. Apart from that, this point might not
+            # be near to the center of weight, which would cause that the algorithm would create a non-optimal (highly
+            # concave) polygon.
+            conversions = {
+                "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
+            }
+            if coordinates_type in conversions:
+                # TODO Test this conversion
+                points = np.apply_along_axis(func1d=conversions[coordinates_type], axis=1, arr=points)
+            else:
+                raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
+                                          "yet.".format(coordinates_type))
+        if np.all(points == points[0, :]):
+            # Degenerate case of initializing mean of the distribution with a sequence of equal points
+            # TODO Check, if this is the right thing to do
+            return np.array([0])
+        # TODO Maybe deal with other degenerate cases
+        mean_point = np.mean(points, axis=0)
+        points -= mean_point
+
+        def to_polar_coordinates(point: np.ndarray) -> np.ndarray:
+            x, y = point
+            r = np.sqrt(x * x + y * y)
+            if r == 0:
+                t = 0
+            else:
+                angle = np.arccos(x / r)
+                if y >= 0:
+                    t = angle
+                else:
+                    t = 2 * np.pi - angle
+            return np.array([r, t])
+
+        points_polar = np.apply_along_axis(func1d=to_polar_coordinates, axis=1, arr=points)
+        sorted_indices = np.argsort(points_polar[:, 1])
+        points_polar = points_polar[sorted_indices]
+        # TODO Maybe test better the following management of exotic cases
+        # Remove duplicates (equal points)
+        i = 0
+        while i < sorted_indices.size - 1:
+            j = i + 1
+            while j < sorted_indices.size and points_polar[i, 1] == points_polar[j, 1]:
+                j += 1
+            j -= 1  # j is the index of the last point with the same t coordinate
+            if j > i:
+                # Some points have the same azimuthal angle
+                k = i
+                while k < j:
+                    l = k + 1
+                    while l <= j:
+                        if points_polar[k, 0] == points_polar[l, 0]:
+                            print("Warning: two points are equal, so one point is deleted")
+                            sorted_indices = np.delete(arr=sorted_indices, obj=l)
+                            points_polar = np.delete(arr=points_polar, obj=l, axis=0)
+                            j -= 1
+                        else:
+                            l += 1
+                    k += 1
+                i = j + 1
+            else:
+                i += 1
+        # Manage situations when multiple points have the same azimuthal angle
+        i = 0
+        while i < sorted_indices.size - 1:
+            if points_polar[i, 1] == points_polar[i + 1, 1]:  # Maybe use np.isclose instead
+                print("Information: some points have the same azimuthal angle")
+                j = i + 2  # Finally j will be equal 1 + (the index of the last point with the same t coordinate)
+                while j < sorted_indices.size and points_polar[i, 1] == points_polar[j, 1]:
+                    j += 1
+                if j - i > 2:
+                    print("Warning: more than two points have the same azimuthal angle, so at least one point will not"
+                          " be included in the polygonization, because then subsequent sides would be collinear")
+                radii = points_polar[i:j, 0]
+                min_radii_index = np.argmin(radii) + i
+                max_radii_index = np.argmax(radii) + i
+                if i == 0:
+                    # From the point with the minimal r to the point with the maximal r (other option: compare somehow
+                    # with the last point, but the last point may also have the same azimuthal angle as another point)
+                    min_radii_point_index = sorted_indices[min_radii_index]
+                    max_radii_point_index = sorted_indices[max_radii_index]
+                    min_radii_point_polar = points_polar[min_radii_index]
+                    max_radii_point_polar = points_polar[max_radii_index]
+                    sorted_indices = np.delete(arr=sorted_indices, obj=np.s_[i:j])
+                    points_polar = np.delete(arr=points_polar, obj=np.s_[i:j], axis=0)
+                    sorted_indices = np.insert(arr=sorted_indices, obj=i, values=[min_radii_point_index,
+                                                                                  max_radii_point_index])
+                    points_polar = np.insert(arr=points_polar, obj=i, values=[min_radii_point_polar,
+                                                                              max_radii_point_polar], axis=0)
+                else:
+                    # Choose a point from two points with minimal and maximal r that is closer to the previous point
+                    # (with smaller t). Connect the previous point with this point, and this point with the other point
+                    # of this two points
+                    previous_point = points[sorted_indices[i - 1]]
+                    indices = np.array([min_radii_index, max_radii_index])
+                    # min_radii_point_index = sorted_indices[min_radii_index]
+                    # max_radii_point_index = sorted_indices[max_radii_index]
+                    # min_radii_point_polar = points_polar[min_radii_index]
+                    # max_radii_point_polar = points_polar[max_radii_index]
+                    # squared_distances = np.array([np.power(points[min_radii_point_index] - previous_point, 2),
+                    #                               np.power(points[max_radii_point_index] - previous_point, 2)])
+                    points_indices = sorted_indices[indices]
+                    polars = points_polar[indices]
+                    squared_distances = np.sum(np.power(points[points_indices] - previous_point, 2), axis=1)
+                    sorted_indices = np.delete(arr=sorted_indices, obj=np.s_[i:j])
+                    points_polar = np.delete(arr=points_polar, obj=np.s_[i:j], axis=0)
+                    order = np.argsort(squared_distances)
+                    sorted_indices = np.insert(arr=sorted_indices, obj=i, values=points_indices[order])
+                    points_polar = np.insert(arr=points_polar, obj=i, values=polars[order], axis=0)
+                # The next point (i + 1)-th need not to be checked, because it must have different t than the (i + 2)-th
+                i += 2
+            else:
+                i += 1
+        if points_polar[sorted_indices.size - 1, 1] == points_polar[0, 1]:
+            print("Warning: all points are collinear")
+            # Can logger be set as a class attribute, so that it would be accessible in the class methods?
+        # Removing collinear points on the sides
+        i = 1
+        while i < sorted_indices.size - 1:
+            if np.cross(points[sorted_indices[i]] - points[sorted_indices[i - 1]],
+                        points[sorted_indices[i + 1]] - points[sorted_indices[i]]) == 0:
+                print("Warning: two sides collinear, so one point is deleted")
+                sorted_indices = np.delete(arr=sorted_indices, obj=i)
+            else:
+                i += 1
+        if np.cross(points[sorted_indices[sorted_indices.size - 1]] - points[sorted_indices[sorted_indices.size - 2]],
+                    points[sorted_indices[0]] - points[sorted_indices[sorted_indices.size - 1]]) == 0:
+            print("Warning: two sides collinear, so one point is deleted")
+            sorted_indices = np.delete(arr=sorted_indices, obj=sorted_indices.size - 1)
+        if np.cross(points[sorted_indices[0]] - points[sorted_indices[sorted_indices.size - 1]],
+                    points[sorted_indices[1]] - points[sorted_indices[0]]) == 0:
+            print("Warning: two sides collinear, so one point is deleted")
+            sorted_indices = np.delete(arr=sorted_indices, obj=0)
+        return sorted_indices
 
 
 class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -1849,6 +1988,10 @@ class ConstrXYConvexPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, ConvexPolygon
     pass
 
 
+class ConstrXYStarShapedPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, StarShapedPolygonRSACMAESOpt):
+    pass
+
+
 class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters,
@@ -1858,7 +2001,37 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
     def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
         """Function returning rsa3d program's parameter particleAttributes based on arg"""
         polygon_particle_attributes = super().arg_to_particle_attributes(arg)
-        return "1 " + polygon_particle_attributes
+        if issubclass(cls, ConvexPolygonRSACMAESOpt):
+            # If the polygon is convex, then don't pass its area
+            return "1 " + polygon_particle_attributes
+        # Extract particle data
+        particle_attributes_list = polygon_particle_attributes.split(" ")
+        vertices_num = int(particle_attributes_list[0])
+        coordinates_type = particle_attributes_list[1]
+        part_data = np.array(particle_attributes_list[2:2 + 2 * vertices_num],
+                             dtype=np.float).reshape(-1, 2)
+        if coordinates_type != "xy":
+            conversions = {
+                "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
+            }
+            if coordinates_type in conversions:
+                # TODO Test this conversion
+                part_data = np.apply_along_axis(func1d=conversions[coordinates_type], axis=1, arr=part_data)
+            else:
+                raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
+                                          "yet.".format(coordinates_type))
+        if ConvexPolygonRSACMAESOpt.select_vertices(coordinates_type="xy", points=part_data).size == vertices_num:
+            # If the polygon is convex, then don't pass its area
+            return "1 " + polygon_particle_attributes
+        else:
+            # Polygon is concave, calculate and pass its area
+            # Method of calculation valid for simple polygons
+            polygon = shapely.geometry.Polygon(shell=part_data)
+            rounded_polygon = polygon.buffer(distance=1, resolution=10 ** 6)
+            # For the resolution of 10^6, the relative error for calculation of the unitary disk area approximately
+            # equals 4.0 * 10^-13 and the time of this calculation is a few seconds
+            area = rounded_polygon.area
+            return " ".join(["1", polygon_particle_attributes, str(area)])
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
@@ -1876,7 +2049,7 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
             }
             if coordinates_type in conversions:
                 # TODO Test this conversion
-                part_data = np.apply_along_axis(conversions[coordinates_type], 0, part_data)
+                part_data = np.apply_along_axis(func1d=conversions[coordinates_type], axis=1, arr=part_data)
             else:
                 raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
                                           "yet.".format(coordinates_type))
@@ -1920,22 +2093,30 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                             shrinkB=0)
                         drawing_area.add_artist(std_dev_arrow)
             return drawing_area
-        # Calculate particle area (works only for convex polygons)
-        center_of_mass = np.mean(part_data, axis=0)
-        area = 0.
-        for vert_num in range(vertices_num):
-            prev_vert_num = vert_num - 1 if vert_num > 0 else vertices_num - 1
-            next_vert_num = (vert_num + 1) % vertices_num
-            area += np.abs(np.cross(part_data[vert_num] - center_of_mass,
-                                    part_data[next_vert_num] - center_of_mass)) / 2
-            first_segment_vec = part_data[prev_vert_num] - part_data[vert_num]
-            second_segment_vec = part_data[next_vert_num] - part_data[vert_num]
-            triangle_side_vec = part_data[next_vert_num] - part_data[prev_vert_num]
-            triangle_height = np.abs(np.cross(first_segment_vec, second_segment_vec)) \
-                / np.linalg.norm(triangle_side_vec)
-            angle = np.arccos(triangle_height / np.linalg.norm(first_segment_vec)) \
-                + np.arccos(triangle_height / np.linalg.norm(second_segment_vec))
-            area += np.linalg.norm(first_segment_vec) + (np.pi - angle) / 2.
+        # Calculate particle area
+        if issubclass(cls, ConvexPolygonRSACMAESOpt) \
+                or ConvexPolygonRSACMAESOpt.select_vertices(coordinates_type="xy", points=part_data).size \
+                == vertices_num:
+            # Method of calculation valid for convex polygons
+            # TODO Maybe add a method calculating particle's area
+            center_of_mass = np.mean(part_data, axis=0)
+            area = 0.
+            for vert_num in range(vertices_num):
+                prev_vert_num = vert_num - 1 if vert_num > 0 else vertices_num - 1
+                next_vert_num = (vert_num + 1) % vertices_num
+                area += np.abs(np.cross(part_data[vert_num] - center_of_mass,
+                                        part_data[next_vert_num] - center_of_mass)) / 2
+                first_segment_vec = part_data[prev_vert_num] - part_data[vert_num]
+                second_segment_vec = part_data[next_vert_num] - part_data[vert_num]
+                triangle_side_vec = part_data[next_vert_num] - part_data[prev_vert_num]
+                triangle_height = np.abs(np.cross(first_segment_vec, second_segment_vec)) \
+                    / np.linalg.norm(triangle_side_vec)
+                angle = np.arccos(triangle_height / np.linalg.norm(first_segment_vec)) \
+                    + np.arccos(triangle_height / np.linalg.norm(second_segment_vec))
+                area += np.linalg.norm(first_segment_vec) + (np.pi - angle) / 2.
+        else:
+            # Area is given in the particleAttributes parameter
+            area = float(particle_attributes_list[-1])
         sqrt_area = np.sqrt(area)
         part_data /= sqrt_area
         if arg is not None:
@@ -1947,7 +2128,9 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                 }
                 if coordinates_type in conversions:
                     # TODO Test this conversion
-                    points_coordinates = np.apply_along_axis(conversions[coordinates_type], 0, points_coordinates)
+                    points_coordinates = np.apply_along_axis(func1d=conversions[coordinates_type],
+                                                             axis=1,
+                                                             arr=points_coordinates)
                 else:
                     raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not"
                                               "implemented yet.".format(coordinates_type))
@@ -2030,6 +2213,11 @@ class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygon
     pass
 
 
+class ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
+                                                            ConstrXYStarShapedPolygonRSACMAESOpt):
+    pass
+
+
 def optimize() -> None:
 
     def opt_fixed_radii() -> None:
@@ -2056,10 +2244,31 @@ def optimize() -> None:
         constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(**opt_class_args)
         constr_fixed_radii_polygon_opt.run()
 
+    def opt_constr_fixed_radii_star_shaped_polygon() -> None:
+        if optimization_input["opt_mode_args"]["initial_mean"] == "origin":
+            initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
+        elif optimization_input["opt_mode_args"]["initial_mean"] == "regular_polygon":
+            vertices_num = optimization_input["opt_mode_args"]["vertices_num"]
+            radius = optimization_input["opt_mode_args"]["initial_mean_params"]["radius"]
+            angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
+            vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([radius * np.cos(angle),
+                                                                                   radius * np.sin(angle)]),
+                                                    axis=0,
+                                                    arr=angles).T
+            shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
+            vertices = vertices_centered + np.array([radius * np.cos(shift_angle), radius * np.sin(shift_angle)])
+            initial_mean = vertices.flatten()[:-3]
+        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(**opt_class_args)
+        constr_fixed_radii_polygon_opt.run()
+
     opt_modes = {
         "optfixedradii": opt_fixed_radii,
         "optconstrfixedradii": opt_constr_fixed_radii,
-        "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon
+        "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon,
+        "optconstrfixedradiistarshapedpolygon": opt_constr_fixed_radii_star_shaped_polygon
     }
     if args.file is None:
         raise TypeError("In optimize mode input file has to be specified using -f argument")
