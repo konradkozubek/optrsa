@@ -41,6 +41,7 @@ import pprint
 import timeit
 import subprocess
 import multiprocessing.pool
+from mpi4py.futures import MPIPoolExecutor
 import datetime
 import pickle
 from wolframclient.evaluation import WolframLanguageSession
@@ -49,6 +50,7 @@ from wolframclient.language import wl
 
 # Get absolute path to optrsa project directory
 _proj_dir = os.path.dirname(__file__)
+# TODO Maybe adjust it in order to point to the correct virtual environment
 # Absolute path to python interpreter, assuming that relative path reads /optrsa-py-3-8-1-venv/bin/python
 _python_path = _proj_dir + "/optrsa-py-3-8-1-venv/bin/python"  # Or: os.path.abspath("optrsa-py-3-8-1-venv/bin/python")
 # Absolute path to Wolfram Kernel script, assuming that relative path reads /exec/wolframscript
@@ -261,6 +263,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  parallel: bool = True,
                  threads: int = None,
                  particle_attributes_parallel: bool = False,
+                 okeanos: bool = False,
+                 max_nodes_number: int = None,
                  input_rel_path: str = None,
                  output_to_file: bool = True,
                  output_to_stdout: bool = False,
@@ -277,6 +281,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.accuracy = accuracy
         self.parallel = parallel
         self.particle_attributes_parallel = particle_attributes_parallel
+        self.okeanos = okeanos
+        self.max_nodes_number = max_nodes_number
         self.output_to_file = output_to_file
         self.output_to_stdout = output_to_stdout
         self.log_generations = log_generations
@@ -399,9 +405,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # TODO Maybe add ompThreads to common self.rsa_parameters if it will not be changed
         # TODO multiprocessing.cpu_count() instead? (Usage on server)
         self.parallel_threads_number = threads if threads is not None else os.cpu_count()  # * 2
-        self.parallel_simulations_number = min(self.parallel_threads_number, self.CMAES.popsize)
+        if not self.okeanos:
+            self.parallel_simulations_number = min(self.parallel_threads_number, self.CMAES.popsize)
+        else:
+            self.parallel_simulations_number = min(self.max_nodes_number - 1, self.CMAES.popsize) \
+                if self.max_nodes_number is not None else self.CMAES.popsize
         # self.omp_threads = self.parallel_threads_number // self.CMAES.popsize\
         #     if self.parallel and self.parallel_threads_number > self.CMAES.popsize else 1
+        # if self.okeanos:
+        #     from mpi4py.futures import MPIPoolExecutor
 
         # Create file for logging generation data
         self.opt_data_filename = self.output_dir + "/optimization.dat" if self.log_generations else None
@@ -477,6 +489,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         logging.config.dictConfig(logging_configuration)
         self.logger = logging.getLogger("optrsa.optimization")
         # Redirect output
+        # TODO Maybe separate redirecting output from unpickling in order to be able to unpickle and use standard output
         self.stdout = sys.stdout
         self.stderr = sys.stderr
         sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
@@ -688,7 +701,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         return values.tolist()  # or list(values), because values.ndim == 1
 
     def rsa_simulation(self, candidate_num: int, arg: np.ndarray,
-                       particle_attributes: Optional[str] = None, omp_threads: Optional[int] = None) -> int:
+                       particle_attributes: Optional[str] = None, omp_threads: Optional[int] = None,
+                       simulation_num: Optional[int] = None) -> int:
         """
         Function running simulations for particle shape specified by arg and waiting for rsa3d process.
         It assigns proper number of OpenMP threads to the rsa3d evaluation.
@@ -697,6 +711,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :param arg: Phenotype candidate's point
         :param particle_attributes: Particle attributes computed for arg - if not given, they are computed
         :param omp_threads: Number of OpenMP threads to assign to rsa3d program - if not given, they are computed
+        :param simulation_num: Simulation number - needs to be passed only when self.okeanos option is True and the
+                               method is called by evaluate_generation_parallel_in_pool method
         :return: RSA simulation's return code
         """
 
@@ -715,15 +731,20 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             omp_threads_attribute = str(omp_threads)
         else:
             if self.parallel:
-                omp_threads_attribute = str(self.omp_threads_number(candidate_num, self.pool_workers_number,
-                                                                    self.parallel_threads_number))
+                if self.okeanos:
+                    omp_threads_attribute = str(self.parallel_threads_number)
+                else:
+                    omp_threads_attribute = str(self.omp_threads_number(candidate_num, self.pool_workers_number,
+                                                                        self.parallel_threads_number))
             else:
                 omp_threads_attribute = str(self.parallel_threads_number)
         rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-ompThreads=" + omp_threads_attribute)
         # Maybe use candidate_num instead of simulation_num to label rsa3d processes' stdins
-        if self.parallel:
+        okeanos_node_process = simulation_num is not None
+        if self.parallel and not okeanos_node_process:
             simulation_num = self.simulations_num
-        simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num), str(self.simulations_num),
+        simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num),
+                                      str(simulation_num if self.parallel else self.simulations_num),
                                       " ".join(map(str, arg))])
         # Earlier: str(self.simulations_num), str(self.CMAES.countevals), str(self.CMAES.countiter), str(candidate_num)
         # - self.CMAES.countevals value is updated of course only after the end of each generation.
@@ -732,7 +753,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # (self.CMAES.countiter), population size and candidate number one can calculate the number of evaluation
         # mentioned in self.CMAES optimizer e.g. in the result (number of evaluation for the best solution)
         rsa_proc_arguments.append(simulation_labels)
-        self.simulations_num += 1
+        if not (self.okeanos and okeanos_node_process):
+            # If this method was run by MPIPoolExecutor worker, original optimization object would not be modified
+            self.simulations_num += 1
         # TODO In case of reevaluation (UH-CMA-ES), simulation_labels will have to identify the evaluation correctly
         #  (self.simulations_num should be fine to ensure distinction)
         # Create subdirectory for output of rsa3d program in this simulation.
@@ -747,6 +770,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             rsa_input_file.write("particleAttributes = {}\n".format(particle_attributes))
         # Create a file for saving the output of rsa3d program
         rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
+        node_message = ""
+        if self.okeanos:
+            node_id = subprocess.check_output(["hostname"]).decode().strip()
+            node_message = "NID: {}, ".format(node_id)
         with open(rsa_output_filename, "w+") as rsa_output_file:
             # Open a process with simulation
             with subprocess.Popen(rsa_proc_arguments,
@@ -756,21 +783,22 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                   cwd=simulation_output_dir) as rsa_process:
                 pid = rsa_process.pid
                 self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {},"
-                                     " PID: {}, ompThreads: {}\n"
+                                     " {}PID: {}, ompThreads: {}\n"
                                      "Argument: {}\n"
                                      "particleAttributes: {}".format(*simulation_labels.split(",")[:3],
+                                                                     node_message,
                                                                      pid,
                                                                      omp_threads_attribute,
                                                                      pprint.pformat(arg),
                                                                      particle_attributes))
                 # For debugging
                 # self.logger.debug(msg="RSA simulation process call: {}".format(" ".join(rsa_proc_arguments)))
-                if self.parallel:
+                if self.parallel and not self.okeanos:
                     self.rsa_processes_stdins[simulation_num] = rsa_process.stdin
                 return_code = rsa_process.wait()
         sim_end_time = datetime.datetime.now()
         threads_message = ""
-        if self.parallel:
+        if self.parallel and not self.okeanos:
             self.remaining_pool_simulations -= 1
             del self.rsa_processes_stdins[simulation_num]
             if 0 < self.remaining_pool_simulations < self.pool_workers_number:
@@ -791,15 +819,37 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     rsa_process_stdin.flush()
                     threads_message += "\n{}: {}".format(remaining_sim_num, new_omp_threads)
         # Get collectors' number
-        rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
-                                                             glob.glob(simulation_output_dir + "/*.dat")[0]])
-        collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
-        self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}, PID: {}."
+        # rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+        #                                                      glob.glob(simulation_output_dir + "/*.dat")[0]])
+        # On Okeanos in the first generation this command used to fail
+        try:
+            rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+                                                                 glob.glob(simulation_output_dir + "/*.dat")[0]])
+            collectors_num_message = str(int(rsa_data_file_lines_count.strip().split()[0]))
+        except subprocess.CalledProcessError as exception:
+            self.logger.warning(msg="subprocess.CalledProcessError raised when checking collectors number:"
+                                    " command: {}, returncode: {}, output: \"{}\"".format(exception.cmd,
+                                                                                          exception.returncode,
+                                                                                          exception.output.decode()))
+            try:
+                rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+                                                                     glob.glob(simulation_output_dir + "/*.dat")[0]],
+                                                                    shell=True)
+                collectors_num_message = str(int(rsa_data_file_lines_count.strip().split()[0]))
+            except subprocess.CalledProcessError as exception:
+                self.logger.warning(msg="subprocess.CalledProcessError raised when checking collectors number with"
+                                        " \"shell\" option set to True: command: {}, returncode: {}, output: \"{}\"."
+                                        " Collectors number will not be logged.".format(exception.cmd,
+                                                                                        -exception.returncode,
+                                                                                        exception.output.decode()))
+                collectors_num_message = "not checked"
+        self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}, {}PID: {}."
                              " Time: {}, collectors: {}, return code: {}"
                              "{}".format(*simulation_labels.split(",")[:3],
+                                         node_message,
                                          pid,
                                          str(sim_end_time - sim_start_time),
-                                         str(collectors_num),
+                                         collectors_num_message,
                                          str(return_code),
                                          threads_message))
         # self.logger.debug(msg="remaining_pool_simulations: {}, rsa_processes_stdins number: {}".format(
@@ -828,34 +878,46 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         values = np.full(shape=len(pheno_candidates), fill_value=np.NaN, dtype=np.float)
         # TODO Maybe define these attributes in constructor
         self.pool_workers_number = self.parallel_simulations_number  # Maybe it will be passed as an argument
-        self.remaining_pool_simulations = len(pheno_candidates)
-        self.rsa_processes_stdins = {}
-        # cand_sim_omp_threads = [self.omp_threads_number(sim_num, self.pool_workers_number,
-        #                                                 self.parallel_threads_number)
-        #                         for sim_num in range(len(pheno_candidates))]
-        # It is said that multiprocessing module does not work with class instance method calls,
-        # but in this case multiprocessing.pool.ThreadPool seems to work fine with the run_simulation method.
-        with multiprocessing.pool.ThreadPool(processes=self.pool_workers_number) as pool:
-            simulations_arguments = list(enumerate(pheno_candidates)) if cand_particle_attributes is None\
-                else list(zip(list(range(len(pheno_candidates))), pheno_candidates, cand_particle_attributes))
-            return_codes = pool.starmap(self.rsa_simulation, simulations_arguments)
-            # Maybe read the last packing fraction value after waiting for simulation process in
-            # rsa_simulation method and check if the simulation labels are correct (which means that rsa3d program
-            # successfully wrote the last line)
-            # TODO Maybe add (it works - probably it doesn't need closing the pool):
-            # pool.close()
-            # pool.join()
-        # TODO Consider returning status from Popen objects (if it is possible) and getting them from pool.map and
-        #  checking, if rsa simulations finished correctly
+        if not self.okeanos:
+            self.remaining_pool_simulations = len(pheno_candidates)
+            self.rsa_processes_stdins = {}
+            # cand_sim_omp_threads = [self.omp_threads_number(sim_num, self.pool_workers_number,
+            #                                                 self.parallel_threads_number)
+            #                         for sim_num in range(len(pheno_candidates))]
+            # It is said that multiprocessing module does not work with class instance method calls,
+            # but in this case multiprocessing.pool.ThreadPool seems to work fine with the run_simulation method.
+            with multiprocessing.pool.ThreadPool(processes=self.pool_workers_number) as pool:
+                simulations_arguments = list(enumerate(pheno_candidates)) if cand_particle_attributes is None\
+                    else list(zip(list(range(len(pheno_candidates))), pheno_candidates, cand_particle_attributes))
+                return_codes = pool.starmap(self.rsa_simulation, simulations_arguments)
+                # Maybe read the last packing fraction value after waiting for simulation process in
+                # rsa_simulation method and check if the simulation labels are correct (which means that rsa3d program
+                # successfully wrote the last line)
+                # TODO Maybe add (it works - probably it doesn't need closing the pool):
+                # pool.close()
+                # pool.join()
+            # TODO Consider returning status from Popen objects (if it is possible) and getting them from pool.map and
+            #  checking, if rsa simulations finished correctly
+        else:
+            with MPIPoolExecutor(max_workers=self.pool_workers_number) as pool:
+                candidate_nums = list(range(len(pheno_candidates)))
+                none_list = [None] * len(pheno_candidates)
+                simulation_nums = list(range(self.simulations_num, self.simulations_num + len(pheno_candidates)))
+                simulations_arguments = list(zip(candidate_nums, pheno_candidates, none_list,
+                                                 none_list, simulation_nums)) if cand_particle_attributes is None\
+                    else list(zip(candidate_nums, pheno_candidates, cand_particle_attributes,
+                                  none_list, simulation_nums))
+                return_codes = pool.starmap(self.rsa_simulation, simulations_arguments)
+            return_codes = list(return_codes)
+            self.simulations_num += len(pheno_candidates)
 
-        with open(self.output_filename, "rb") as rsa_output_file:
+        with open(self.output_filename, "r") as rsa_output_file:
             # TODO Maybe find more efficient or elegant solution
             # TODO Maybe iterate through lines in file in reversed order - results of the current generation should be
             #  at the end
             for line in rsa_output_file:
-                # Does the line need to be decoded (line_str = line.decode())?
-                evaluation_data = line.split(b"\t")
-                evaluation_labels = evaluation_data[0].split(b",")
+                evaluation_data = line.split("\t")
+                evaluation_labels = evaluation_data[0].split(",")
                 if int(evaluation_labels[0]) == self.CMAES.countiter:
                     candidate_num = int(evaluation_labels[1])
                     mean_packing_fraction = float(evaluation_data[1])
@@ -1257,6 +1319,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.CMAES.logger.add()
         else:
             self.logger.info(msg="Start of resumed optimization")
+        if self.okeanos:
+            self.logger.info(msg="")
+            self.logger.info(msg="Parallel simulations number: {}".format(self.parallel_simulations_number))
+            self.logger.info(msg="Parallel threads number: {}".format(self.parallel_threads_number))
         while not self.CMAES.stop():
             gen_start_time = datetime.datetime.now()
             self.logger.info(msg="")
@@ -1321,12 +1387,25 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                                         str(return_code))
                             signal_name = ""
                             if return_code < 0:
+                                system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
+                                okeanos_system_info = "Linux 4.12.14-150.17_5.0.86-cray_ari_s x86_64"
                                 # See https://docs.python.org/3/library/subprocess.html#subprocess.Popen.returncode
-                                if sys.platform.startswith("linux"):
-                                    signal_info = subprocess.check_output("kill -l " + str(-return_code), shell=True)
+                                if not self.okeanos and system_info != okeanos_system_info:
+                                    if sys.platform.startswith("linux"):
+                                        signal_info = subprocess.check_output("kill -l " + str(-return_code),
+                                                                              shell=True)
+                                    else:
+                                        signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
+                                    signal_name = signal_info.decode().strip().upper()
                                 else:
-                                    signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
-                                signal_name = signal_info.decode().strip().upper()
+                                    # "kill -l [number]" on okeanos doesn't work, see /usr/include/asm/signal.h
+                                    # TODO Test it
+                                    if return_code == -10:
+                                        signal_name = "USR1"
+                                    elif return_code == -12:
+                                        signal_name = "USR2"
+                                    else:
+                                        signal_name = str(-return_code)
                                 warning_message += ", signal name: {}".format(signal_name)
                             # self.logger.debug(msg=signal_info)
                             # self.logger.debug(msg=signal_name)
@@ -2290,6 +2369,7 @@ def plot_cmaes_optimization_data() -> None:
     opt_class.plot_optimization_data(signature=args.signature, modulo=modulo)
 
 
+#TODO Adjust it in order to check okeanos option
 def resume_optimization() -> None:
     if args.signature is None:
         raise TypeError("In resumeoptimization mode optimization signature has to be specified using -s argument")
