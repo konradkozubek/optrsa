@@ -34,6 +34,7 @@ import io
 import os
 import glob
 import shutil
+import traceback
 import logging
 import logging.config
 import yaml
@@ -716,146 +717,209 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :return: RSA simulation's return code
         """
 
-        sim_start_time = datetime.datetime.now()
-        # Run a process with rsa3d program running simulation
-        rsa_proc_arguments = self.rsa_proc_arguments[:]  # Copy the values of the template arguments
-        if particle_attributes is None:
-            particle_attributes = self.arg_to_particle_attributes(arg)
-        rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-particleAttributes=" + particle_attributes)
-        # TODO Maybe move part of this code to constructor
-        # omp_threads_attribute = str(self.omp_threads)
-        # if self.parallel and self.parallel_threads_number > self.CMAES.popsize\
-        #         and candidate_num >= self.CMAES.popsize * (self.omp_threads + 1) - self.parallel_threads_number:
-        #     omp_threads_attribute = str(self.omp_threads + 1)
-        if omp_threads is not None:
-            omp_threads_attribute = str(omp_threads)
-        else:
-            if self.parallel:
-                if self.okeanos:
-                    omp_threads_attribute = str(self.parallel_threads_number)
-                else:
-                    omp_threads_attribute = str(self.omp_threads_number(candidate_num, self.pool_workers_number,
-                                                                        self.parallel_threads_number))
-            else:
-                omp_threads_attribute = str(self.parallel_threads_number)
-        rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-ompThreads=" + omp_threads_attribute)
-        # Maybe use candidate_num instead of simulation_num to label rsa3d processes' stdins
-        okeanos_node_process = simulation_num is not None
-        if self.parallel and not okeanos_node_process:
-            simulation_num = self.simulations_num
-        simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num),
-                                      str(simulation_num if self.parallel else self.simulations_num),
-                                      " ".join(map(str, arg))])
-        # Earlier: str(self.simulations_num), str(self.CMAES.countevals), str(self.CMAES.countiter), str(candidate_num)
-        # - self.CMAES.countevals value is updated of course only after the end of each generation.
-        # self.simulations_num is the number ordering the beginning of simulation, the position of data in
-        # packing-fraction-vs-params.txt corresponds to ordering of the end of simulation, and from generation number
-        # (self.CMAES.countiter), population size and candidate number one can calculate the number of evaluation
-        # mentioned in self.CMAES optimizer e.g. in the result (number of evaluation for the best solution)
-        rsa_proc_arguments.append(simulation_labels)
-        if not (self.okeanos and okeanos_node_process):
-            # If this method was run by MPIPoolExecutor worker, original optimization object would not be modified
-            self.simulations_num += 1
-        # TODO In case of reevaluation (UH-CMA-ES), simulation_labels will have to identify the evaluation correctly
-        #  (self.simulations_num should be fine to ensure distinction)
-        # Create subdirectory for output of rsa3d program in this simulation.
-        # simulation_labels contain generation number, candidate number and evaluation number.
-        simulation_output_dir = self.rsa_output_dir + "/" + "_".join(simulation_labels.split(",")[:3])
-        if not os.path.exists(simulation_output_dir):
-            os.makedirs(simulation_output_dir)
-            # Maybe use shutil instead
-        # Create rsa3d input file containing simulation-specific parameters in simulation output directory
-        with open(simulation_output_dir + "/rsa-simulation-input.txt", "w+") as rsa_input_file:
-            rsa_input_file.write("ompThreads = {}\n".format(omp_threads_attribute))
-            rsa_input_file.write("particleAttributes = {}\n".format(particle_attributes))
-        # Create a file for saving the output of rsa3d program
-        rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
-        node_message = ""
-        if self.okeanos:
-            node_id = subprocess.check_output(["hostname"]).decode().strip()
-            node_message = "NID: {}, ".format(node_id)
-        with open(rsa_output_filename, "w+") as rsa_output_file:
-            # Open a process with simulation
-            with subprocess.Popen(rsa_proc_arguments,
-                                  stdin=subprocess.PIPE,  # Maybe specify it only if self.parallel
-                                  stdout=rsa_output_file,
-                                  stderr=rsa_output_file,
-                                  cwd=simulation_output_dir) as rsa_process:
-                pid = rsa_process.pid
-                self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {},"
-                                     " {}PID: {}, ompThreads: {}\n"
-                                     "Argument: {}\n"
-                                     "particleAttributes: {}".format(*simulation_labels.split(",")[:3],
-                                                                     node_message,
-                                                                     pid,
-                                                                     omp_threads_attribute,
-                                                                     pprint.pformat(arg),
-                                                                     particle_attributes))
-                # For debugging
-                # self.logger.debug(msg="RSA simulation process call: {}".format(" ".join(rsa_proc_arguments)))
-                if self.parallel and not self.okeanos:
-                    self.rsa_processes_stdins[simulation_num] = rsa_process.stdin
-                return_code = rsa_process.wait()
-        sim_end_time = datetime.datetime.now()
-        threads_message = ""
-        if self.parallel and not self.okeanos:
-            self.remaining_pool_simulations -= 1
-            del self.rsa_processes_stdins[simulation_num]
-            if 0 < self.remaining_pool_simulations < self.pool_workers_number:
-                # Send messages with new numbers of OpenMP threads to rsa3d processes
-                # TODO Maybe remember numbers of threads and send messages only when numbers need to be changed
-                threads_message = "\nRemaining parallel simulations: {}." \
-                                  " Increasing numbers of OpenMP threads.\n" \
-                                  "simulation number: ompThreads".format(self.remaining_pool_simulations)
-                for rsa_process_num, remaining_sim_num, rsa_process_stdin\
-                        in zip(list(range(len(self.rsa_processes_stdins))),
-                               list(self.rsa_processes_stdins),
-                               list(self.rsa_processes_stdins.values())):
-                    new_omp_threads = self.omp_threads_number(rsa_process_num, self.remaining_pool_simulations,
-                                                              self.parallel_threads_number)
-                    # Flushing is needed to send the message and the newline is needed for rsa3d program to end reading
-                    # the message
-                    rsa_process_stdin.write("ompThreads:{}\n".format(new_omp_threads).encode())
-                    rsa_process_stdin.flush()
-                    threads_message += "\n{}: {}".format(remaining_sim_num, new_omp_threads)
-        # Get collectors' number
-        # rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
-        #                                                      glob.glob(simulation_output_dir + "/*.dat")[0]])
-        # On Okeanos in the first generation this command used to fail
         try:
-            rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
-                                                                 glob.glob(simulation_output_dir + "/*.dat")[0]])
-            collectors_num_message = str(int(rsa_data_file_lines_count.strip().split()[0]))
-        except subprocess.CalledProcessError as exception:
-            self.logger.warning(msg="subprocess.CalledProcessError raised when checking collectors number:"
-                                    " command: {}, returncode: {}, output: \"{}\"".format(exception.cmd,
-                                                                                          exception.returncode,
-                                                                                          exception.output.decode()))
+            sim_start_time = datetime.datetime.now()
+            # Run a process with rsa3d program running simulation
+            rsa_proc_arguments = self.rsa_proc_arguments[:]  # Copy the values of the template arguments
+            if particle_attributes is None:
+                particle_attributes = self.arg_to_particle_attributes(arg)
+            rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-particleAttributes=" + particle_attributes)
+            # TODO Maybe move part of this code to constructor
+            # omp_threads_attribute = str(self.omp_threads)
+            # if self.parallel and self.parallel_threads_number > self.CMAES.popsize\
+            #         and candidate_num >= self.CMAES.popsize * (self.omp_threads + 1) - self.parallel_threads_number:
+            #     omp_threads_attribute = str(self.omp_threads + 1)
+            if omp_threads is not None:
+                omp_threads_attribute = str(omp_threads)
+            else:
+                if self.parallel:
+                    if self.okeanos:
+                        omp_threads_attribute = str(self.parallel_threads_number)
+                    else:
+                        omp_threads_attribute = str(self.omp_threads_number(candidate_num, self.pool_workers_number,
+                                                                            self.parallel_threads_number))
+                else:
+                    omp_threads_attribute = str(self.parallel_threads_number)
+            rsa_proc_arguments.insert(self.rsa_proc_args_last_param_index, "-ompThreads=" + omp_threads_attribute)
+            # Maybe use candidate_num instead of simulation_num to label rsa3d processes' stdins
+            okeanos_node_process = simulation_num is not None
+            if self.parallel and not okeanos_node_process:
+                simulation_num = self.simulations_num
+            simulation_labels = ",".join([str(self.CMAES.countiter), str(candidate_num),
+                                          str(simulation_num if self.parallel else self.simulations_num),
+                                          " ".join(map(str, arg))])
+            # Earlier: str(self.simulations_num), str(self.CMAES.countevals), str(self.CMAES.countiter),
+            # str(candidate_num) - self.CMAES.countevals value is updated of course only after the end of each
+            # generation. self.simulations_num is the number ordering the beginning of simulation, the position of data
+            # in packing-fraction-vs-params.txt corresponds to ordering of the end of simulation, and from generation
+            # number (self.CMAES.countiter), population size and candidate number one can calculate the number of
+            # evaluation mentioned in self.CMAES optimizer e.g. in the result (number of evaluation for the best
+            # solution)
+            rsa_proc_arguments.append(simulation_labels)
+            if not (self.okeanos and okeanos_node_process):
+                # If this method was run by MPIPoolExecutor worker, original optimization object would not be modified
+                self.simulations_num += 1
+            # TODO In case of reevaluation (UH-CMA-ES), simulation_labels will have to identify the evaluation correctly
+            #  (self.simulations_num should be fine to ensure distinction)
+            # Create subdirectory for output of rsa3d program in this simulation.
+            # simulation_labels contain generation number, candidate number and evaluation number.
+            simulation_output_dir = self.rsa_output_dir + "/" + "_".join(simulation_labels.split(",")[:3])
+            if not os.path.exists(simulation_output_dir):
+                os.makedirs(simulation_output_dir)
+                # Maybe use shutil instead
+            # Create rsa3d input file containing simulation-specific parameters in simulation output directory
+            with open(simulation_output_dir + "/rsa-simulation-input.txt", "w+") as rsa_input_file:
+                rsa_input_file.write("ompThreads = {}\n".format(omp_threads_attribute))
+                rsa_input_file.write("particleAttributes = {}\n".format(particle_attributes))
+            # Check the node ID if run on Okeanos
+            node_message = ""
+            if self.okeanos:
+                try:
+                    node_id = subprocess.check_output(["hostname"]).decode().strip()
+                except subprocess.CalledProcessError as exception:
+                    self.logger.warning(msg="subprocess.CalledProcessError raised when checking host name:"
+                                            " command: {}, return code: {}, output: \"{}\".\n{}\n"
+                                            "Node ID will not be logged.".format(exception.cmd,
+                                                                                 -exception.returncode,
+                                                                                 exception.output.decode(),
+                                                                                 traceback.format_exc(limit=6).strip()))
+                    node_id = "not checked"
+                except Exception as exception:
+                    self.logger.warning(msg="Exception raised when checking host name; {}: {}\n"
+                                            "{}".format(type(exception).__name__, exception,
+                                                        traceback.format_exc(limit=6).strip()))
+                    node_id = "not checked"
+                node_message = "NID: {}, ".format(node_id)
+            # Create a file for saving the output of rsa3d program
+            rsa_output_filename = simulation_output_dir + "/rsa-simulation-output.txt"
+            with open(rsa_output_filename, "w+") as rsa_output_file:
+                # Open a process with simulation
+                with subprocess.Popen(rsa_proc_arguments,
+                                      stdin=subprocess.PIPE,  # Maybe specify it only if self.parallel
+                                      stdout=rsa_output_file,
+                                      stderr=rsa_output_file,
+                                      cwd=simulation_output_dir) as rsa_process:
+                    pid = rsa_process.pid
+                    self.logger.info(msg="RSA simulation start: generation no. {}, candidate no. {}, simulation no. {},"
+                                         " {}PID: {}, ompThreads: {}\n"
+                                         "Argument: {}\n"
+                                         "particleAttributes: {}".format(*simulation_labels.split(",")[:3],
+                                                                         node_message,
+                                                                         pid,
+                                                                         omp_threads_attribute,
+                                                                         pprint.pformat(arg),
+                                                                         particle_attributes))
+                    # For debugging
+                    # self.logger.debug(msg="RSA simulation process call: {}".format(" ".join(rsa_proc_arguments)))
+                    if self.parallel and not self.okeanos:
+                        self.rsa_processes_stdins[simulation_num] = rsa_process.stdin
+                    return_code = rsa_process.wait()
+            sim_end_time = datetime.datetime.now()
+            threads_message = ""
+            if self.parallel and not self.okeanos:
+                self.remaining_pool_simulations -= 1
+                del self.rsa_processes_stdins[simulation_num]
+                if 0 < self.remaining_pool_simulations < self.pool_workers_number:
+                    # Send messages with new numbers of OpenMP threads to rsa3d processes
+                    # TODO Maybe remember numbers of threads and send messages only when numbers need to be changed
+                    threads_message = "\nRemaining parallel simulations: {}." \
+                                      " Increasing numbers of OpenMP threads.\n" \
+                                      "simulation number: ompThreads".format(self.remaining_pool_simulations)
+                    for rsa_process_num, remaining_sim_num, rsa_process_stdin\
+                            in zip(list(range(len(self.rsa_processes_stdins))),
+                                   list(self.rsa_processes_stdins),
+                                   list(self.rsa_processes_stdins.values())):
+                        new_omp_threads = self.omp_threads_number(rsa_process_num, self.remaining_pool_simulations,
+                                                                  self.parallel_threads_number)
+                        # Flushing is needed to send the message and the newline is needed for rsa3d program to end
+                        # reading the message
+                        rsa_process_stdin.write("ompThreads:{}\n".format(new_omp_threads).encode())
+                        rsa_process_stdin.flush()
+                        threads_message += "\n{}: {}".format(remaining_sim_num, new_omp_threads)
+            # Get collectors' number
+            # rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+            #                                                      glob.glob(simulation_output_dir + "/*.dat")[0]])
+            # On Okeanos in the first generation this command used to fail
             try:
                 rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
-                                                                     glob.glob(simulation_output_dir + "/*.dat")[0]],
-                                                                    shell=True)
+                                                                     glob.glob(simulation_output_dir + "/*.dat")[0]])
                 collectors_num_message = str(int(rsa_data_file_lines_count.strip().split()[0]))
             except subprocess.CalledProcessError as exception:
-                self.logger.warning(msg="subprocess.CalledProcessError raised when checking collectors number with"
-                                        " \"shell\" option set to True: command: {}, returncode: {}, output: \"{}\"."
-                                        " Collectors number will not be logged.".format(exception.cmd,
-                                                                                        -exception.returncode,
-                                                                                        exception.output.decode()))
+                self.logger.warning(msg="subprocess.CalledProcessError raised when checking collectors number:"
+                                        " command: {}, return code: {},"
+                                        " output: \"{}\".\n{}".format(exception.cmd,
+                                                                      -exception.returncode,
+                                                                      exception.output.decode(),
+                                                                      traceback.format_exc(limit=6).strip()))
+                try:
+                    rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+                                                                         glob.glob(simulation_output_dir
+                                                                                   + "/*.dat")[0]],
+                                                                        shell=True)
+                    collectors_num_message = str(int(rsa_data_file_lines_count.strip().split()[0]))
+                except subprocess.CalledProcessError as exception:
+                    self.logger.warning(msg="subprocess.CalledProcessError raised when checking collectors number with"
+                                            " \"shell\" option set to True: command: {}, return code: {},"
+                                            " output: \"{}\".\n{}\nCollectors number"
+                                            " will not be logged.".format(exception.cmd,
+                                                                          -exception.returncode,
+                                                                          exception.output.decode(),
+                                                                          traceback.format_exc(limit=6).strip()))
+                    collectors_num_message = "not checked"
+                except Exception as exception:
+                    self.logger.warning(msg="Exception raised when checking collectors number; {}: {}\n{}\nCollectors"
+                                            " number will not be logged.".format(type(exception).__name__, exception,
+                                                                                 traceback.format_exc(limit=6).strip()))
+                    collectors_num_message = "not checked"
+            except Exception as exception:
+                self.logger.warning(msg="Exception raised when checking collectors number; {}: {}\n{}\nCollectors"
+                                        " number will not be logged.".format(type(exception).__name__, exception,
+                                                                             traceback.format_exc(limit=6).strip()))
                 collectors_num_message = "not checked"
-        self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {}, {}PID: {}."
-                             " Time: {}, collectors: {}, return code: {}"
-                             "{}".format(*simulation_labels.split(",")[:3],
-                                         node_message,
-                                         pid,
-                                         str(sim_end_time - sim_start_time),
-                                         collectors_num_message,
-                                         str(return_code),
-                                         threads_message))
-        # self.logger.debug(msg="remaining_pool_simulations: {}, rsa_processes_stdins number: {}".format(
-        #     self.remaining_pool_simulations, len(self.rsa_processes_stdins)))
-        # self.logger.debug(msg="rsa_processes_stdins:\n{}".format(self.rsa_processes_stdins))
+            self.logger.info(msg="RSA simulation end: generation no. {}, candidate no. {}, simulation no. {},"
+                                 " {}PID: {}. Time: {}, collectors: {}, return code: {}"
+                                 "{}".format(*simulation_labels.split(",")[:3],
+                                             node_message,
+                                             pid,
+                                             str(sim_end_time - sim_start_time),
+                                             collectors_num_message,
+                                             str(return_code),
+                                             threads_message))
+            # self.logger.debug(msg="remaining_pool_simulations: {}, rsa_processes_stdins number: {}".format(
+            #     self.remaining_pool_simulations, len(self.rsa_processes_stdins)))
+            # self.logger.debug(msg="rsa_processes_stdins:\n{}".format(self.rsa_processes_stdins))
+        # TODO Maybe check also for subprocess.CalledProcessError and set return code appropriately
+        except Exception as exception:
+            self.logger.warning(msg="Exception raised in rsa_simulation method for generation no. {}, candidate no. {},"
+                                    " argument: {}; {}: {}\n"
+                                    "{}\n"
+                                    "Candidate will be resampled.".format(str(self.CMAES.countiter), str(candidate_num),
+                                                                          pprint.pformat(arg),
+                                                                          type(exception).__name__, exception,
+                                                                          traceback.format_exc(limit=6).strip()))
+            return_code = -1
         return return_code
+
+    # def safe_rsa_simulation_wrapper(self, rsa_simulation_method: Callable[..., int]) -> Callable[..., int]:
+    #     def safe_rsa_simulation(custom_self, candidate_num: int, arg: np.ndarray,
+    #                             particle_attributes: Optional[str] = None, omp_threads: Optional[int] = None,
+    #                             simulation_num: Optional[int] = None) -> int:
+    #         rsa_simulation_method.__doc__
+    #
+    #         try:
+    #             return_code = rsa_simulation_method(candidate_num, arg, particle_attributes,
+    #                                                 omp_threads, simulation_num)
+    #         # TODO Maybe check also for subprocess.CalledProcessError and set return code appropriately
+    #         except Exception as exception:
+    #             self.logger.warning(msg="Exception raised in rsa_simulation method for generation no. {},"
+    #                                     " candidate no. {}, simulation no. {}; {}: {}\n{}\n"
+    #                                     "Candidate will be resampled.".format(self.CMAES.countiter, candidate_num,
+    #                                                                           simulation_num,
+    #                                                                           type(exception).__name__, exception,
+    #                                                                           traceback.format_exc(limit=6).strip()))
+    #             return_code = -1
+    #         return return_code
+    #     return safe_rsa_simulation
 
     # TODO Maybe find a way to pass arguments to optrsa program's process in runtime to change the overall number of
     #  used threads from the next generation on
@@ -907,8 +971,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                  none_list, simulation_nums)) if cand_particle_attributes is None\
                     else list(zip(candidate_nums, pheno_candidates, cand_particle_attributes,
                                   none_list, simulation_nums))
-                return_codes = pool.starmap(self.rsa_simulation, simulations_arguments)
-            return_codes = list(return_codes)
+                return_codes_iterator = pool.starmap(self.rsa_simulation, simulations_arguments)
+            return_codes = list(return_codes_iterator)
             self.simulations_num += len(pheno_candidates)
 
         with open(self.output_filename, "r") as rsa_output_file:
@@ -1387,10 +1451,17 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                                         str(return_code))
                             signal_name = ""
                             if return_code < 0:
-                                system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
+                                try:
+                                    system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
+                                except Exception as exception:
+                                    self.logger.warning(msg="Exception raised when checking system information;"
+                                                            " {}: {}\n{}".format(type(exception).__name__, exception,
+                                                                                 traceback.format_exc(limit=6).strip()))
+                                    system_info = "not checked"
                                 okeanos_system_info = "Linux 4.12.14-150.17_5.0.86-cray_ari_s x86_64"
                                 # See https://docs.python.org/3/library/subprocess.html#subprocess.Popen.returncode
-                                if not self.okeanos and system_info != okeanos_system_info:
+                                if not self.okeanos and system_info != okeanos_system_info \
+                                        and system_info != "not checked":
                                     if sys.platform.startswith("linux"):
                                         signal_info = subprocess.check_output("kill -l " + str(-return_code),
                                                                               shell=True)
@@ -1497,6 +1568,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.CMAES.tell(pheno_candidates, values)
             self.CMAES.logger.add()
             # Pickling of the object
+            # TODO Add jsonpickle pickling
             self.pickle()
             gen_end_time = datetime.datetime.now()
             self.logger.info("Generation time: {}".format(str(gen_end_time - gen_start_time)))
@@ -2369,7 +2441,6 @@ def plot_cmaes_optimization_data() -> None:
     opt_class.plot_optimization_data(signature=args.signature, modulo=modulo)
 
 
-#TODO Adjust it in order to check okeanos option
 def resume_optimization() -> None:
     if args.signature is None:
         raise TypeError("In resumeoptimization mode optimization signature has to be specified using -s argument")
@@ -2391,6 +2462,23 @@ def resume_optimization() -> None:
     optimization.logger.info(msg="")
     optimization.logger.info(msg="")
     optimization.logger.info(msg="Resuming optimization")
+    interrupted_simulations_dirs = glob.glob(optimization.rsa_output_dir + "/{}_*".format(optimization.CMAES.countiter))
+    if len(interrupted_simulations_dirs) > 0:
+        optimization.logger.info(msg="Moving interrupted generation simulations' directories {} to the unused"
+                                     " simulations folder".format(", ".join(map(os.path.basename,
+                                                                                interrupted_simulations_dirs))))
+        try:
+            unused_simulations_dir = optimization.rsa_output_dir + "/unused_simulations"
+            if not os.path.exists(unused_simulations_dir):
+                os.makedirs(unused_simulations_dir)
+            for directory in interrupted_simulations_dirs:
+                shutil.move(directory, unused_simulations_dir)
+        except Exception as exception:
+            optimization.logger.warning(msg="Exception raised when moving interrupted generation simulations'"
+                                            " directories; {}: {}\n{}".format(type(exception).__name__, exception,
+                                                                              traceback.format_exc(limit=6).strip()))
+            # TODO Deal with this error, check what would happen if the directories weren't (re)moved, maybe use another
+            #  way to move directories
     # Overwrite optimization options, if the file argument was given
     if args.file is not None:
         with open(_input_dir + "/" + args.file, "r") as opt_input_file:
@@ -2410,13 +2498,19 @@ def resume_optimization() -> None:
             optimization.rsa_parameters.update(resume_input["rsa_parameters"])
             if not optimization.input_given:
                 optimization.all_rsa_parameters.update(resume_input["rsa_parameters"])
-        for attr in ["accuracy", "parallel", "particle_attributes_parallel"]:
+        for attr in ["accuracy", "parallel", "particle_attributes_parallel", "okeanos", "max_nodes_number"]:
             if attr in resume_input:
                 setattr(optimization, attr, resume_input[attr])
         if "threads" in resume_input:
             optimization.parallel_threads_number = resume_input["threads"]
-            optimization.parallel_simulations_number = min(optimization.parallel_threads_number,
-                                                           optimization.CMAES.popsize)
+        if any(attr in resume_input for attr in ["threads", "okeanos", "max_nodes_number"]):
+            if not optimization.okeanos:
+                optimization.parallel_simulations_number = min(optimization.parallel_threads_number,
+                                                               optimization.CMAES.popsize)
+            else:
+                optimization.parallel_simulations_number = min(optimization.max_nodes_number - 1,
+                                                               optimization.CMAES.popsize) \
+                    if optimization.max_nodes_number is not None else optimization.CMAES.popsize
         # TODO Set (and maybe check) other attributes, if needed
         if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) or "accuracy" in resume_input:
             # All attributes that are used in optimization.rsa_proc_arguments have to be set already, if present
