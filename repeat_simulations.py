@@ -1,7 +1,8 @@
 import optrsa
 import argparse
-import subprocess
+# import subprocess
 import glob
+# import traceback
 import pandas as pd
 import sys
 import logging
@@ -24,16 +25,23 @@ def load_optimization_data(signature: str) -> pd.DataFrame:
             evaluation_labels = evaluation_data[0].split(",")
             simulation_output_dir = optimization_output_dir + "/outrsa/" + "_".join(evaluation_labels)
             # Get collectors' number
-            rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
-                                                                 glob.glob(simulation_output_dir + "/*.dat")[0]])
-            collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
+            collectors_num = len(glob.glob(simulation_output_dir + "/*.bin"))
+            # try:
+            #     rsa_data_file_lines_count = subprocess.check_output(["wc", "-l",
+            #                                                          glob.glob(simulation_output_dir + "/*.dat")[0]])
+            #     collectors_num = int(rsa_data_file_lines_count.strip().split()[0])
+            # except Exception as exception:
+            #     print("Exception raised when checking collectors number; {}: {}\n"
+            #           "{}".format(type(exception).__name__, exception,
+            #                       traceback.format_exc(limit=6).strip()))
+            #     collectors_num = len(glob.glob(simulation_output_dir + "/*.bin"))
             # If multiple lines in packing-fraction-vs-params.txt file correspond to the same candidate, the
             # values from the last such line will be used
             # optimization_data = optimization_data.append(dict(zip(opt_data_columns, [*map(int, evaluation_labels),
             #                                                                 float(evaluation_data[1]),
             #                                                                 float(evaluation_data[2]),
             #                                                                 collectors_num])), ignore_index=True)
-            simulation_data_list.append(pd.DataFrame([[*map(int, evaluation_labels),
+            simulation_data_list.append(pd.DataFrame([[*map(int, evaluation_labels[:3]),
                                                        evaluation_data[4],
                                                        float(evaluation_data[1]),
                                                        float(evaluation_data[2]),

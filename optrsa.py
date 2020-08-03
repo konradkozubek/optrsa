@@ -5,6 +5,7 @@ import cma
 
 import sys
 import matplotlib
+import subprocess
 # PyCharm Professional sets other backend, which may cause trouble
 if sys.platform.startswith('darwin'):  # MacOS
     # See https://matplotlib.org/tutorials/introductory/usage.html#backends
@@ -12,8 +13,15 @@ if sys.platform.startswith('darwin'):  # MacOS
     # Qt5Agg, Qt4Agg - can't import qt bindings, GTK3Agg, GTK3Cairo - can't install all dependencies. nbAgg - fails.
     # WX does not have access to the screen. TkAgg works, WebAgg (with tornado imported) works worse than TkAgg.
 else:
-    # Partially tested
-    matplotlib.use("Qt5Agg")  # Maybe try also TkAgg (works) if interactivity is needed. Agg is not interactive.
+    try:
+        # TODO Maybe use platform module instead
+        system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
+    except Exception as exception:
+        system_info = "not checked"
+    okeanos_system_info = "Linux 4.12.14-150.17_5.0.86-cray_ari_s x86_64"
+    if system_info != okeanos_system_info and system_info != "not checked":
+        # Partially tested
+        matplotlib.use("Qt5Agg")  # Maybe try also TkAgg (works) if interactivity is needed. Agg is not interactive.
 import matplotlib.pyplot as plt
 import matplotlib.transforms
 import matplotlib.offsetbox
@@ -29,20 +37,26 @@ import argparse
 import json
 import pandas as pd
 from typing import Callable, Tuple, Union, List, Optional
+from collections import namedtuple
 import abc
 import io
 import os
 import glob
 import shutil
+from file_read_backwards import FileReadBackwards
 import traceback
 import logging
 import logging.config
 import yaml
 import pprint
 import timeit
-import subprocess
+# import subprocess
 import multiprocessing.pool
+# TODO Maybe import MPIPoolExecutor only in the optimize mode, if okeanos_parallel option is set
 from mpi4py.futures import MPIPoolExecutor
+from concurrent.futures import Future
+import threading
+import time
 import datetime
 import pickle
 from wolframclient.evaluation import WolframLanguageSession
@@ -214,6 +228,13 @@ class OptimizationFormatter(logging.Formatter):
             return output[:-1]
 
 
+# TODO Maybe change it into a typed named tuple
+DefaultRSASimulationResult = namedtuple(typename="DefaultRSASimulationResult",
+                                        field_names=["candidate_num", "simulation_num", "first_collector_num",
+                                                     "collectors_num", "return_code", "node_message", "pid",
+                                                     "start_time", "time", "particles_numbers"])
+
+
 class RSACMAESOptimization(metaclass=abc.ABCMeta):
     """
     Abstract base class for performing optimization of RSA packing fraction with CMA-ES optimizer
@@ -250,6 +271,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                        "worstpfrac": np.float, "worstpfracstddev": np.float,
                                        "candidatesdata": str}
 
+    # DefaultRSASimulationResult = namedtuple(typename="DefaultRSASimulationResult",
+    #                                         field_names=["candidate_num", "simulation_num", "first_collector_num",
+    #                                                      "collectors_num", "return_code", "node_message", "pid",
+    #                                                      "start_time", "time", "particles_numbers"])
+
     @abc.abstractmethod
     def get_arg_signature(self) -> str:
         return ""
@@ -266,6 +292,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  particle_attributes_parallel: bool = False,
                  okeanos: bool = False,
                  max_nodes_number: int = None,
+                 okeanos_parallel: bool = False,
+                 nodes_number: int = None,
+                 min_collectors_number: int = 10,
+                 collectors_per_task: int = 1,
                  input_rel_path: str = None,
                  output_to_file: bool = True,
                  output_to_stdout: bool = False,
@@ -284,6 +314,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.particle_attributes_parallel = particle_attributes_parallel
         self.okeanos = okeanos
         self.max_nodes_number = max_nodes_number
+        self.okeanos_parallel = okeanos_parallel
+        self.nodes_number = nodes_number
+        self.min_collectors_number = max(min_collectors_number, 2)
+        self.collectors_per_task = collectors_per_task
         self.output_to_file = output_to_file
         self.output_to_stdout = output_to_stdout
         self.log_generations = log_generations
@@ -415,6 +449,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #     if self.parallel and self.parallel_threads_number > self.CMAES.popsize else 1
         # if self.okeanos:
         #     from mpi4py.futures import MPIPoolExecutor
+        if self.okeanos_parallel and self.nodes_number is None:
+            # It is assumed that the SLURM job has the same number of assigned nodes
+            self.nodes_number = 1 + self.CMAES.popsize
 
         # Create file for logging generation data
         self.opt_data_filename = self.output_dir + "/optimization.dat" if self.log_generations else None
@@ -432,7 +469,12 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         for running rsa3d program in other process
         :return: None
         """
-        self.rsa_proc_arguments = [_rsa_path, "accuracy"]
+        self.rsa_proc_arguments = [_rsa_path]
+        # TODO Maybe implement in in another way
+        if not self.okeanos_parallel:
+            self.rsa_proc_arguments.append("accuracy")
+        else:
+            self.rsa_proc_arguments.append("simulate")
         if self.input_given:
             self.rsa_proc_arguments.extend(["-f", self.input_filename])
             self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
@@ -440,9 +482,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         else:
             self.rsa_proc_arguments.extend(["-{}={}".format(param_name, param_value)
                                             for param_name, param_value in self.all_rsa_parameters.items()])
-        # Index at which particleAttributes parameter will be inserted
-        self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
-        self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
+        if not self.okeanos_parallel:
+            # Index at which particleAttributes parameter will be inserted
+            self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
+            self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
 
     def __getstate__(self):
         """
@@ -991,6 +1034,588 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # return values.tolist()  # or list(values), because values.ndim == 1
         return list(values), return_codes
 
+    def default_rsa_simulation(self, candidate_num: int, simulation_num: int, first_collector_num: int,
+                               rsa_proc_arguments: List[str], task_submitting_time: datetime.datetime,
+                               collectors_num: Optional[int] = 1, first_part_sim: Optional[bool] = False) \
+            -> Tuple[int, int, int, int, int, str, int, datetime.datetime, str, np.ndarray]:
+        """
+        Function running collectors_num simulations using rsa_proc_arguments and waiting for rsa3d process. Meant to be
+        called by run_simulations_on_okeanos method.
+
+        :param candidate_num: Identification number of the candidate
+        :param simulation_num: Identification number of the simulation
+        :param first_collector_num: Identification number of the first collector
+        :param rsa_proc_arguments: rsa3d process' arguments, which are updated with from, collectors and appendToDat
+                                   parameters
+        :param task_submitting_time: datetime.datetime object representing the time of submitting the partial simulation
+                                     task to the pool of workers in run_simulations_on_okeanos method. Used in a logging
+                                     purpose.
+        :param collectors_num: Number of collectors to generate (optional), defaults to 1
+        :param first_part_sim: bool value telling if the partial simulation is the first in entire RSA simulation for
+                               the phenotype candidate. Used in a logging purpose.
+        :return: DefaultRSASimulationResult namedtuple object containing result of the partial simulation
+        """
+
+        sim_start_time = datetime.datetime.now()
+        return_code: int = 0
+        particles_numbers: list = []
+        pid: int = -1
+        node_message: str = ""
+        time: str = ""
+        if self.okeanos_parallel:
+            try:
+                node_id = subprocess.check_output(["hostname"]).decode().strip()
+            except subprocess.CalledProcessError as exception:
+                self.logger.warning(msg="subprocess.CalledProcessError raised when checking host name:"
+                                        " command: {}, return code: {}, output: \"{}\".\n{}\n"
+                                        "Node ID will not be logged.".format(exception.cmd,
+                                                                             -exception.returncode,
+                                                                             exception.output.decode(),
+                                                                             traceback.format_exc(limit=6).strip()))
+                node_id = "not checked"
+            except Exception as exception:
+                self.logger.warning(msg="Exception raised when checking host name; {}: {}\n"
+                                        "{}".format(type(exception).__name__, exception,
+                                                    traceback.format_exc(limit=6).strip()))
+                node_id = "not checked"
+            node_message = "NID: {}, ".format(node_id)
+        try:
+            if first_part_sim:  # first_collector_num == 0
+                self.logger.info(msg="\nRSA simulation start: generation number {}, candidate number {},"
+                                     " simulation number {}{}\n".format(self.CMAES.countiter,
+                                                                        candidate_num,
+                                                                        simulation_num,
+                                                                        ", " + node_message[:-2]))
+            # Prepare RSA process arguments
+            rsa_proc_arguments = rsa_proc_arguments[:]  # Maybe it is not needed
+            rsa_proc_arguments.extend(["-from=" + str(first_collector_num), "-collectors=" + str(collectors_num),
+                                       "-appendToDat=true"])
+            # Create a file for saving the output of rsa3d program
+            simulation_output_dir = self.rsa_output_dir + "/" + str(self.CMAES.countiter) + "_" + str(candidate_num) \
+                + "_" + str(simulation_num)
+            collectors_filename_info = "collector"
+            if collectors_num == 1:
+                collectors_filename_info += "-" + str(first_collector_num)
+            else:
+                collectors_filename_info += "s-{}-{}".format(first_collector_num, first_collector_num + collectors_num)
+            rsa_output_filename = simulation_output_dir + "/rsa-{}-output.txt".format(collectors_filename_info)
+            with open(rsa_output_filename, "w+") as rsa_output_file:
+                # Open a process with simulation
+                with subprocess.Popen(rsa_proc_arguments,
+                                      # stdin=subprocess.PIPE,
+                                      stdout=rsa_output_file,
+                                      stderr=rsa_output_file,
+                                      cwd=simulation_output_dir) as rsa_process:
+                    pid = rsa_process.pid
+                    self.logger.info(msg="RSA part. sim. start: gen. no. {}, cand. no. {}, sim. no. {},"
+                                         " first col. no.: {}, collectors: {}."
+                                         " {}PID: {}, task beg. delay: {}".format(self.CMAES.countiter,
+                                                                                  candidate_num,
+                                                                                  simulation_num,
+                                                                                  first_collector_num,
+                                                                                  collectors_num,
+                                                                                  node_message,
+                                                                                  pid,
+                                                                                  sim_start_time
+                                                                                  - task_submitting_time))
+                    self.logger.debug(msg="RSA process arguments: {}".format(" ".join(rsa_proc_arguments)))
+                    # For debugging
+                    # self.logger.debug(msg="RSA simulation process call: {}".format(" ".join(rsa_proc_arguments)))
+                    return_code = rsa_process.wait()
+            sim_end_time = datetime.datetime.now()
+            time = str(sim_end_time - sim_start_time)
+            if return_code != 0:
+                self.logger.warning(msg="RSA partial simulation for generation no. {}, candidate no. {},"
+                                        " simulation no. {}, first collector number: {}, collectors number: {}"
+                                        " returned code: {}. {}PID: {}, time: {}.\nCollectors data"
+                                        " will be ignored.".format(self.CMAES.countiter,
+                                                                   candidate_num,
+                                                                   simulation_num,
+                                                                   first_collector_num,
+                                                                   collectors_num,
+                                                                   return_code,
+                                                                   node_message,
+                                                                   pid,
+                                                                   time))
+            # Read RSA data file and get collectors' particle numbers
+            rsa_data_file_glob = glob.glob(simulation_output_dir + "/*.dat")
+            if len(rsa_data_file_glob) == 0:
+                raise FileNotFoundError("RSA data file not found in the simulation directory")
+            with FileReadBackwards(rsa_data_file_glob[0]) as rsa_data_file:
+                # Get lines one by one starting from the last line up
+                for line in rsa_data_file:
+                    collector_data = line.split("\t")
+                    collector_num = int(collector_data[0])
+                    if first_collector_num <= collector_num < first_collector_num + collectors_num:
+                        particles_numbers.insert(0, int(collector_data[1]))
+                        if collector_num == first_collector_num:
+                            break
+            self.logger.debug(msg="RSA partial simulation end: generation no. {}, candidate no. {}, simulation no. {},"
+                                  " first collector number: {}, collectors number: {},"
+                                  " {}PID: {}. Time: {}, return code: {}\n"
+                                  "Read collectors' particles numbers: {}".format(self.CMAES.countiter,
+                                                                                  candidate_num,
+                                                                                  simulation_num,
+                                                                                  first_collector_num,
+                                                                                  collectors_num,
+                                                                                  node_message,
+                                                                                  pid,
+                                                                                  time,
+                                                                                  return_code,
+                                                                                  ", ".join(map(str,
+                                                                                                particles_numbers))))
+        except Exception as exception:
+            self.logger.warning(msg="Exception raised in default_rsa_simulation method for generation no. {},"
+                                    " candidate no. {}, simulation no. {}, first collector number: {},"
+                                    " collectors number: {}{}; {}: {}\n{}\nCollectors data"
+                                    " will be ignored.".format(self.CMAES.countiter, candidate_num, simulation_num,
+                                                               first_collector_num, collectors_num, node_message,
+                                                               type(exception).__name__, exception,
+                                                               traceback.format_exc(limit=6).strip()))
+            return_code = -1 if return_code == 0 else return_code
+        result = DefaultRSASimulationResult(candidate_num=candidate_num,
+                                            simulation_num=simulation_num,
+                                            first_collector_num=first_collector_num,
+                                            collectors_num=collectors_num,
+                                            return_code=return_code,
+                                            node_message=node_message,
+                                            pid=pid,
+                                            start_time=sim_start_time,
+                                            time=time,
+                                            particles_numbers=np.array(particles_numbers))
+        # return candidate_num, simulation_num, first_collector_num, collectors_num, return_code, node_message, pid, \
+        #     sim_start_time, time, np.array(particles_numbers)
+        return result
+
+    def run_simulations_on_okeanos(self, pheno_candidates: List[np.ndarray],
+                                   cand_particle_attributes: Optional[List[str]] = None,
+                                   candidates_numbers: Optional[List[int]] = None) \
+            -> Tuple[List[float], List[int]]:
+        """
+        Method running rsa simulations for phenotype candidates given in pheno_candidates parameter in parallel using
+        self.nodes_number - 1 Okeanos nodes as workers. Each node evaluates self.collectors_per_task collectors at once
+        during a partial simulation using self.default_rsa_simulation method. Worker nodes number can be bigger than,
+        equal to or smaller than the candidates number. Each simulation ends if mean packing fraction standard deviation
+        is equal to or smaller than self.accuracy, unless collectors number is smaller than self.min_collectors_number.
+        The method uses mpi4py.futures.MPIPoolExecutor to submit tasks (partial simulations) to processes on worker
+        nodes. After submitting initial tasks, results are managed and subsequent tasks are submitted using manage_tasks
+        function as concurrent.futures.Future objects' callbacks. Since mpi4py.futures.MPIPoolExecutor is used, to
+        guarantee that worker processes will be spawned on different nodes, SLURM job has to specify number of nodes and
+        set ntasks-per-node option to 1. Then optrsa module has to be run using srun python -m mpi4py.futures -m optrsa
+        (optrsa arguments).
+
+        :param pheno_candidates: List of NumPy ndarrays containing phenotype candidates
+        :param cand_particle_attributes: List of candidates' particleAttributes parameters (optional). If not given,
+                                         they will be calculated in parallel. It has to be of the same length as
+                                         pheno_candidates.
+        :param candidates_numbers: List of candidates numbers (optional). If not given, they will be set to the indices
+                                   of the pheno_candidates list. This argument can be used to specify candidates'
+                                   numbers when repeating RSA simulations for several candidates in generation, it has
+                                   to be of the same length as pheno_candidates.
+        :return: 2-tuple with list of fitness function values (minus mean packing fraction) for phenotype candidates and
+                 list of return codes of RSA simulations for phenotype candidates. If RSA simulation for a candidate
+                 failed or was terminated, the candidate's value is np.NaN.
+        """
+
+        rsa_proc_arguments = self.rsa_proc_arguments[:]  # Copy the values of the template arguments
+        simulations_num = len(pheno_candidates)
+        if cand_particle_attributes is None:
+            # Compute candidates' particleAttributes parameters in parallel
+            with multiprocessing.pool.ThreadPool(processes=min(simulations_num, os.cpu_count())) as pool:
+                cand_particle_attributes = pool.map(self.arg_to_particle_attributes, pheno_candidates)
+        if candidates_numbers is None:
+            candidates_numbers = list(range(simulations_num))
+        simulations_numbers = list(range(self.simulations_num, self.simulations_num + simulations_num))
+        # TODO Maybe move it to the set_rsa_proc_arguments method
+        rsa_proc_arguments.append("-ompThreads=" + str(self.parallel_threads_number))
+        # For each simulation create a subdirectory for output of rsa3d program and rsa3d input file
+        for candidate_num, simulation_num, particle_attributes in zip(candidates_numbers, simulations_numbers,
+                                                                      cand_particle_attributes):
+            simulation_output_dir = self.rsa_output_dir + "/" + str(self.CMAES.countiter) + "_" + str(candidate_num) \
+                + "_" + str(simulation_num)
+            if not os.path.exists(simulation_output_dir):
+                os.makedirs(simulation_output_dir)
+            # Create rsa3d input file containing simulation-specific parameters in the simulation output directory
+            with open(simulation_output_dir + "/rsa-simulation-input.txt", "w") as rsa_input_file:
+                rsa_input_file.write("ompThreads = {}\n".format(str(self.parallel_threads_number)))
+                rsa_input_file.write("particleAttributes = {}\n".format(particle_attributes))
+
+        values = np.full(shape=simulations_num, fill_value=np.NaN, dtype=np.float)
+        return_codes = np.full(shape=simulations_num, fill_value=-1, dtype=np.int)
+        self.pool_workers_number = self.nodes_number - 1  # Maybe it will be passed as an argument
+
+        self.logger.info(msg="Generation no. {}, running {} simulations"
+                             " using {} nodes".format(self.CMAES.countiter, simulations_num, self.pool_workers_number))
+        for candidate_num, simulation_num, arg, particle_attributes in zip(candidates_numbers, simulations_numbers,
+                                                                           pheno_candidates, cand_particle_attributes):
+            self.logger.info(msg="Candidate no. {}, simulation no. {}".format(candidate_num, simulation_num))
+            self.logger.info(msg="Argument: {}".format(arg))  # pprint.pformat(arg)
+            self.logger.info(msg="particleAttributes: {}".format(particle_attributes))
+
+        def simulation_nodes_number(simulation_number: int, parallel_simulations_number: int) -> int:
+            """
+            Method calculating number of nodes to assign to RSA simulation
+
+            :param simulation_number: Number (index) of simulation from range [0, parallel_simulations_number - 1]
+            :param parallel_simulations_number: Number of parallel running simulations
+            :return: Number of nodes to assign to RSA simulation
+            """
+
+            sim_nodes_number = self.pool_workers_number // parallel_simulations_number
+            if simulation_number < self.pool_workers_number - parallel_simulations_number * sim_nodes_number:
+                sim_nodes_number += 1
+            return sim_nodes_number
+
+        # TODO Maybe add adjusting collectors_per_task value
+        # simulations_nodes_numbers = np.ndarray([simulation_nodes_number(sim_num, simulations_num)
+        #                                         for sim_num in range(simulations_num)])
+        # active_simulations_indices = np.arange(simulations_num)
+        # ending_sim_lock = multiprocessing.Lock()
+        ending_sim_lock = threading.Lock()
+
+        class OkeanosSimulation:
+
+            collectors_ids: np.ndarray  # list of used collectors' numbers
+            particles_nums: np.ndarray  # list of the corresponding particles' numbers
+            packing_frac: float  # mean packing fraction
+            standard_dev: float  # mean packing fraction standard deviation
+            next_collector: int  # the collector index for the next task to be submitted (first free index not
+            # corresponding to a submitted task)
+            # data_lock: multiprocessing.Lock
+            data_lock: threading.Lock
+
+            start_time: Union[None, datetime.datetime]
+            pending_part_sims: int
+            nodes_number: int
+            active: bool
+            tasks: list
+
+            def __init__(self):
+                self.collectors_ids = np.empty(shape=0, dtype=np.int)
+                self.particles_nums = np.empty(shape=0, dtype=np.int)
+                self.packing_frac = 0
+                self.standard_dev = 0
+                self.next_collector = 0
+                # self.data_lock = multiprocessing.Lock()
+                self.data_lock = threading.Lock()
+
+                self.start_time = None
+                self.pending_part_sims = 0
+                self.nodes_number = 0
+                self.active = True
+                self.tasks = []
+
+        sims_data = [OkeanosSimulation() for _ in range(simulations_num)]
+        packing_area = float(self.rsa_parameters["surfaceVolume"]) if self.input_given \
+            else float(self.all_rsa_parameters["surfaceVolume"])
+        # self.accuracy
+        pending_simulations = simulations_num
+        # evaluation_finished = multiprocessing.Event()
+        # After the end of evaluation program was still waiting when using multiprocessing.Event()
+        # TODO Maybe try using threading.Event() instead, maybe try using threading (or multiprocessing) Condition
+        normal_evaluation = True
+
+        # Solution inspired by https://stackoverflow.com/questions/51879070/python-executor-spawn-tasks-from-done
+        # -callback-recursively-submit-tasks
+        with MPIPoolExecutor(max_workers=self.pool_workers_number) as pool:
+
+            def manage_tasks(future: Future) -> None:
+                try:
+                    nonlocal pending_simulations, normal_evaluation  # , sims_data
+                    if not normal_evaluation:
+                        return
+                    if future.cancelled():
+                        for sim in sims_data:
+                            if future in sim.tasks:
+                                sim.pending_part_sims -= 1
+                                sim.tasks.remove(future)
+                                break
+                        # if pending_simulations == 0:  # Maybe it is not needed
+                        #     evaluation_finished.set()
+                        return
+                    # try:
+                    #     (candidate_num, first_collector_num, collectors_num, return_code,
+                    #      particles_numbers) = future.result()
+                    # except Exception as exception:
+                    #     # TODO Maybe change it in order to avoid infinite recursion
+                    #     self.logger.warning(msg="Exception raised while getting the future's result in manage_tasks"
+                    #                             " function {}: {}\n{}\nThe task will be"
+                    #                             " submitted again.".format(type(exception).__name__, exception,
+                    #                                                        traceback.format_exc(limit=6).strip()))
+                    #     pool.submit(self.default_rsa_simulation, )  # We probably don't know the task's parameters
+                    res: DefaultRSASimulationResult = future.result()  # During a normal operation,
+                    # default_rsa_simulation method should catch every exception
+                    # (candidate_num, simulation_num, first_collector_num, collectors_num, return_code, node_message,
+                    #  pid, start_time, time, particles_numbers) = future.result()
+                    # TODO Maybe store future objects in sim.tasks together with the call arguments
+                    #  - default_rsa_simulation method would not have to return them. Then find simulation owning the
+                    #  future:
+                    #  for sim in sims_data:
+                    #      if future in sim.tasks:
+                    #          sim.tasks.index(future)
+                    #          break
+                    simulation_index = res.simulation_num - self.simulations_num
+                    sim = sims_data[simulation_index]
+                    # if sim.start_time is None:  # res.first_collector_num == 0
+                    #     sim.start_time = res.start_time
+                    # One does not need to return res.start_time now
+                    sim.pending_part_sims -= 1
+                    sim.tasks.remove(future)
+                    data_lock_message = ""
+                    if not sim.data_lock.acquire(blocking=False):  # if not sim.data_lock.acquire(block=False):
+                        self.logger.info(msg="Waiting for the data lock. {}".format(res.node_message[:-2]))
+                        lock_pending_start = datetime.datetime.now()
+                        sim.data_lock.acquire()
+                        lock_pending_end = datetime.datetime.now()
+                        data_lock_message = "Waiting for lock acquiring time: {}. ".format(lock_pending_end
+                                                                                           - lock_pending_start)
+                    # time.sleep(2)  # Testing the data lock
+                    # Apparently locks aren't necessary, because callbacks are most probably executed sequentially
+                    # Locks would be necessary if the future's callback function would asynchronously spawn another
+                    # thread that would call manage_tasks function
+                    if not sim.active:
+                        # TODO Maybe don't ignore this results
+                        self.logger.info(msg="RSA part. sim. end: gen. no. {}, cand. no. {}, sim. no. {},"
+                                             " first col. no.: {}, collectors: {}, {}PID: {}, time: {}, ret. code: {}."
+                                             " {}Pend. part. sims.: {}/{}. Simulation is not active,"
+                                             " result will be ignored".format(self.CMAES.countiter,
+                                                                              res.candidate_num,
+                                                                              res.simulation_num,
+                                                                              res.first_collector_num,
+                                                                              res.collectors_num,
+                                                                              res.node_message,
+                                                                              res.pid,
+                                                                              res.time,
+                                                                              res.return_code,
+                                                                              data_lock_message,
+                                                                              sim.pending_part_sims,
+                                                                              sim.nodes_number))
+                        sim.data_lock.release()
+                        # if pending_simulations == 0:
+                        #     evaluation_finished.set()
+                        return
+                    if res.return_code != 0:
+                        # TODO Maybe change it in order to avoid infinite recursion
+                        # Warning was logged in the default_rsa_simulation method
+                        # Submit a new task
+                        sim.data_lock.release()
+                        submit_task(simulation_index)
+                        return
+                    # Calculate new mean packing fraction and standard deviation and submit a new task, if the standard
+                    # deviation is bigger than the accuracy, or end the simulation if it is smaller or equal to accuracy
+                    # TODO If manage_tasks will be run in a separate thread, check if locking works and sims_data cannot
+                    #  be changed during calculations
+                    prev_collectors_number = sim.particles_nums.size
+                    cur_collectors_number = prev_collectors_number + res.particles_numbers.size
+                    sim.packing_frac = (sim.packing_frac * prev_collectors_number + np.sum(res.particles_numbers)
+                                        / packing_area) / cur_collectors_number
+                    collectors_indices = np.arange(res.first_collector_num,
+                                                   res.first_collector_num + res.collectors_num)
+                    sim.collectors_ids = np.concatenate((sim.collectors_ids, collectors_indices))
+                    sim.particles_nums = np.concatenate((sim.particles_nums, res.particles_numbers))
+                    # TODO Implement calculating running mean standard deviation
+                    if cur_collectors_number > 1:
+                        sim.standard_dev = np.sqrt(np.sum(np.power(sim.particles_nums / packing_area - sim.packing_frac,
+                                                                   2))
+                                                   / (cur_collectors_number - 1) / cur_collectors_number)
+                    if sim.standard_dev > self.accuracy or cur_collectors_number < self.min_collectors_number:
+                        self.logger.info(msg="RSA part. sim. end: gen. no. {}, cand. no. {}, sim. no. {},"
+                                             " first col. no.: {}, collectors: {}. {}Current pack. frac.: {},"
+                                             " cur. std. dev.: {}, pend. part. sims.: {}/{}. {}PID: {}, time: {},"
+                                             " ret. code: {}".format(self.CMAES.countiter,
+                                                                     res.candidate_num,
+                                                                     res.simulation_num,
+                                                                     res.first_collector_num,
+                                                                     res.collectors_num,
+                                                                     data_lock_message,
+                                                                     sim.packing_frac,
+                                                                     sim.standard_dev,
+                                                                     sim.pending_part_sims,
+                                                                     sim.nodes_number,
+                                                                     res.node_message,
+                                                                     res.pid,
+                                                                     res.time,
+                                                                     res.return_code))
+                        sim.data_lock.release()
+                        # Submit a new task
+                        submit_task(simulation_index)
+                        return
+                    else:
+                        # End of the RSA simulation for the candidate
+                        # TODO Maybe test storing candidates' future objects, maybe cancel pending tasks belonging to
+                        #  an inactive simulation, maybe after the initial submits (which number is equal to the nodes
+                        #  number) submit some additional tasks in order to feed pool of workers without delays
+                        # TODO If manage_tasks will be run in a separate thread, check if locking works and
+                        #  pending_simulations and active attributes are not changed during calculations
+                        ending_sim_lock_message = ""
+                        if not ending_sim_lock.acquire(blocking=False):  # if not ending_sim_lock.acquire(block=False):
+                            self.logger.info(msg="Waiting for the ending simulation lock."
+                                                 " {}".format(res.node_message[:-2]))
+                            lock_pending_start = datetime.datetime.now()
+                            ending_sim_lock.acquire()
+                            lock_pending_end = datetime.datetime.now()
+                            ending_sim_lock_message = "waiting for lock" \
+                                                      " acquiring time: {}, ".format(lock_pending_end
+                                                                                     - lock_pending_start)
+                        # time.sleep(3)  # Testing the ending simulation lock
+                        sim.active = False
+                        sim.data_lock.release()
+                        pending_simulations -= 1
+                        values[simulation_index] = -sim.packing_frac
+                        return_codes[simulation_index] = 0
+                        # Adjust numbers of nodes assigned to the remaining simulations
+                        sim_num = 0
+                        nodes_message = "\nRemaining parallel simulations: {}. Increasing numbers of nodes assigned" \
+                                        " to the simulations.\n" \
+                                        "simulation number: nodes number".format(pending_simulations)
+                        for sim_index, simulation in enumerate(sims_data):
+                            if simulation.active:
+                                prev_nodes_number = simulation.nodes_number
+                                simulation.nodes_number = simulation_nodes_number(sim_num, pending_simulations)
+                                for _ in range(simulation.nodes_number - prev_nodes_number):
+                                    submit_task(sim_index)
+                                nodes_message += "\n{}: {}".format(simulations_numbers[sim_index],
+                                                                   simulation.nodes_number)
+                                sim_num += 1
+                        self.logger.info(msg="RSA part. sim. end: gen. no. {}, cand. no. {}, sim. no. {},"
+                                             " first col. no.: {}, collectors: {}. {}Current pack. frac.: {},"
+                                             " cur. std. dev.: {}, pend. part. sims.: {}/{}."
+                                             " {}PID: {}, time: {}, ret. code: {}\n"
+                                             "\nRSA simulation end. Time: {}, collectors: {},"
+                                             " {}return code: 0\n{}\n".format(self.CMAES.countiter,
+                                                                              res.candidate_num,
+                                                                              res.simulation_num,
+                                                                              res.first_collector_num,
+                                                                              res.collectors_num,
+                                                                              data_lock_message,
+                                                                              sim.packing_frac,
+                                                                              sim.standard_dev,
+                                                                              sim.pending_part_sims,
+                                                                              sim.nodes_number,
+                                                                              res.node_message,
+                                                                              res.pid,
+                                                                              res.time,
+                                                                              res.return_code,
+                                                                              datetime.datetime.now() - sim.start_time,
+                                                                              sim.particles_nums.size,
+                                                                              ending_sim_lock_message,
+                                                                              nodes_message))
+                        ending_sim_lock.release()
+                        # if pending_simulations == 0:
+                        #     evaluation_finished.set()
+                        return
+                except Exception as exception:
+                    # Check the future result and the simulation data
+                    future_result_message = "not available"
+                    simulation_data_message = "not found"
+                    if "res" in locals():
+                        future_result_message = str(res)
+                        if isinstance(res.simulation_num, int):
+                            simulation_index = res.simulation_num - self.simulations_num
+                            sim = sims_data[simulation_index]
+                            simulation_data_message = pprint.pformat(vars(sim))
+                    # Release any lock that is acquired
+                    for sim in sims_data:
+                        if sim.data_lock.locked():
+                            sim.data_lock.release()
+                    if ending_sim_lock.locked():
+                        ending_sim_lock.release()
+                    self.logger.warning(msg="Exception raised in manage_tasks function; {}: {}\n"
+                                            "{}\nFuture result: {}\nSimulation data: {}\nSimulations that have not"
+                                            " ended yet will be repeated".format(type(exception).__name__, exception,
+                                                                                 traceback.format_exc(limit=6).strip(),
+                                                                                 future_result_message,
+                                                                                 simulation_data_message))
+                    # evaluation_finished.set()
+                    normal_evaluation = False  # TODO If more tasks than workers will be submitted, cancel other tasks
+                    return
+
+            def submit_task(simulation_index: int):
+                sim = sims_data[simulation_index]
+                first_part_sim = sim.start_time is None
+                if first_part_sim:
+                    sim.start_time = datetime.datetime.now()
+                future = pool.submit(self.default_rsa_simulation,
+                                     candidates_numbers[simulation_index],
+                                     simulations_numbers[simulation_index],
+                                     sim.next_collector,
+                                     rsa_proc_arguments + ["-particleAttributes="
+                                                           + cand_particle_attributes[simulation_index]],
+                                     datetime.datetime.now(),
+                                     self.collectors_per_task,
+                                     first_part_sim)
+                future.add_done_callback(manage_tasks)
+                sim.next_collector += self.collectors_per_task
+                sim.pending_part_sims += 1
+                sim.tasks.append(future)
+
+            # Submit initial tasks
+            nodes_message = "Initial numbers of nodes assigned to the simulations:\n" \
+                            "simulation number: nodes number".format(pending_simulations)
+            for simulation_index, sim in enumerate(sims_data):
+                sim.nodes_number = simulation_nodes_number(simulation_index, pending_simulations)
+                for _ in range(sim.nodes_number):
+                    submit_task(simulation_index)
+                nodes_message += "\n{}: {}".format(simulations_numbers[simulation_index], sim.nodes_number)
+            self.logger.info(msg=nodes_message + "\n")
+
+            # evaluation_finished.wait()
+            while pending_simulations > 0 and normal_evaluation:
+                time.sleep(1)
+            # pool.shutdown()
+
+        if pending_simulations != 0:
+            # TODO Maybe set return codes other than -1
+            active_simulations = []
+            for simulation_index, sim in enumerate(sims_data):
+                if sim.active:
+                    active_simulations.append(candidates_numbers[simulation_index])
+            self.logger.warning(msg="RSA simulations for candidates no. {}"
+                                    " will be repeated".format(", ".join(map(str, active_simulations))))
+
+        self.simulations_num += len(pheno_candidates)
+
+        # Print evaluation results to the output file
+        with open(self.output_filename, "a") as output_file:
+            for arg, candidate_num, simulation_num, particle_attributes, sim in zip(pheno_candidates,
+                                                                                    candidates_numbers,
+                                                                                    simulations_numbers,
+                                                                                    cand_particle_attributes,
+                                                                                    sims_data):
+                if not sim.active:
+                    output_file.write("{},{},{},{}"
+                                      "\t{}\t{}\t{}\t{}\n".format(self.CMAES.countiter,
+                                                                  candidate_num,
+                                                                  simulation_num,
+                                                                  " ".join(map(str, arg)),
+                                                                  sim.packing_frac,
+                                                                  sim.standard_dev,
+                                                                  self.mode_rsa_parameters["particleType"],
+                                                                  particle_attributes))
+
+        # For each simulation, if there are unused collectors, print their indices to a file
+        for simulation_index, sim in enumerate(sims_data):
+            unused_collectors_ids = np.setdiff1d(np.arange(sim.next_collector), sim.collectors_ids,
+                                                 assume_unique=True)
+            # Alternative solution:
+            # unused_collectors_ids = [id for id in range(sim.next_collector) if id not in sim.collectors_ids]
+            # More efficient alternative solution that could be used if sim.collectors_ids were sorted:
+            # unused_collectors_ids = []
+            # prev_collector_id = -1
+            # for collector_id in np.append(sim.collectors_ids, sim.next_collector):
+            #     if collector_id - prev_collector_id > 1:
+            #         unused_collectors_ids.extend(range(prev_collector_id + 1, collector_id))
+            #     prev_collector_id = collector_id
+            if unused_collectors_ids.size > 0:
+                # TODO Maybe log a warning
+                simulation_output_dir = self.rsa_output_dir + "/" + str(self.CMAES.countiter) \
+                                        + "_" + str(candidates_numbers[simulation_index]) \
+                                        + "_" + str(simulations_numbers[simulation_index])
+                with open(simulation_output_dir + "/unused_collectors.txt", "w") as unused_collectors_file:
+                    unused_collectors_file.writelines("{}\n".format(id) for id in unused_collectors_ids)
+
+        return list(values), list(return_codes)
+
     def log_generation_data(self) -> None:
         func_data = pd.DataFrame(columns=["arg", "partattrs", "pfrac", "pfracstddev"])
         with open(self.output_filename) as output_file:
@@ -1387,6 +2012,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.logger.info(msg="")
             self.logger.info(msg="Parallel simulations number: {}".format(self.parallel_simulations_number))
             self.logger.info(msg="Parallel threads number: {}".format(self.parallel_threads_number))
+        if self.okeanos_parallel:
+            self.logger.info(msg="")
+            self.logger.info(msg="Population size: {}".format(self.CMAES.popsize))
+            self.logger.info(msg="Nodes number: {}".format(self.nodes_number))
+            self.logger.info(msg="Parallel threads number: {}".format(self.parallel_threads_number))
+            self.logger.info(msg="Collectors per task: {}".format(self.collectors_per_task))
+            self.logger.info(msg="Target accuracy: {}".format(self.accuracy))
+            self.logger.info(msg="Minimum collectors number: {}".format(self.min_collectors_number))
         while not self.CMAES.stop():
             gen_start_time = datetime.datetime.now()
             self.logger.info(msg="")
@@ -1426,114 +2059,201 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             # TODO Maybe make evaluate_generation_* methods return values as np.ndarray
             if self.parallel:
                 if self.particle_attributes_parallel:
-                    values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates)
+                    if not self.okeanos_parallel:
+                        values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates)
+                    else:
+                        values, return_codes = self.run_simulations_on_okeanos(pheno_candidates)
                 else:
                     self.logger.info(msg="Computing candidates' particleAttributes parameters in series")
                     cand_particle_attributes = [self.arg_to_particle_attributes(arg) for arg in pheno_candidates]
                     self.logger.debug(msg="Candidates' particleAttributes parameters:")
                     for line in pprint.pformat(cand_particle_attributes, width=200).split("\n"):
                         self.logger.debug(msg=line)
-                    values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates,
-                                                                                     cand_particle_attributes)
+                    if not self.okeanos_parallel:
+                        values, return_codes = self.evaluate_generation_parallel_in_pool(pheno_candidates,
+                                                                                         cand_particle_attributes)
+                    else:
+                        values, return_codes = self.run_simulations_on_okeanos(pheno_candidates,
+                                                                               cand_particle_attributes)
                 # TODO Implement computing it in parallel (probably using evaluate_generation_parallel_in_pool method,
                 #  use also a function that for number of simulations and simulation number returns number
                 #  of ompThreads)
                 # TODO Maybe add an option to somehow tell the program to end optimization (e.g. kill -KILL an RSA
                 #  process or send a signal to the main process)
                 take_median = np.full(shape=len(pheno_candidates), fill_value=False)
-                # while np.any(np.isnan(values)):
-                while np.any(np.logical_and(np.isnan(values), np.logical_not(take_median))):
-                    for candidate_num, candidate, candidate_value, return_code\
-                            in zip(list(range(len(pheno_candidates))), pheno_candidates, values, return_codes):
-                        if np.isnan(candidate_value):
-                            warning_message = "RSA simulation for candidate no. {} did not succeed." \
-                                              " Return code: {}".format(str(candidate_num),
-                                                                        str(return_code))
-                            signal_name = ""
-                            if return_code < 0:
-                                try:
-                                    system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
-                                except Exception as exception:
-                                    self.logger.warning(msg="Exception raised when checking system information;"
-                                                            " {}: {}\n{}".format(type(exception).__name__, exception,
-                                                                                 traceback.format_exc(limit=6).strip()))
-                                    system_info = "not checked"
-                                okeanos_system_info = "Linux 4.12.14-150.17_5.0.86-cray_ari_s x86_64"
-                                # See https://docs.python.org/3/library/subprocess.html#subprocess.Popen.returncode
-                                if not self.okeanos and system_info != okeanos_system_info \
-                                        and system_info != "not checked":
-                                    if sys.platform.startswith("linux"):
-                                        signal_info = subprocess.check_output("kill -l " + str(-return_code),
-                                                                              shell=True)
+                if not self.okeanos_parallel:
+                    # while np.any(np.isnan(values)):
+                    while np.any(np.logical_and(np.isnan(values), np.logical_not(take_median))):
+                        for candidate_num, candidate, candidate_value, return_code\
+                                in zip(list(range(len(pheno_candidates))), pheno_candidates, values, return_codes):
+                            if np.isnan(candidate_value):
+                                warning_message = "RSA simulation for candidate no. {} did not succeed." \
+                                                  " Return code: {}".format(str(candidate_num),
+                                                                            str(return_code))
+                                signal_name = ""
+                                if return_code < 0:
+                                    try:
+                                        system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
+                                    except Exception as exception:
+                                        self.logger.warning(msg="Exception raised when checking system information;"
+                                                                " {}: {}\n"
+                                                                "{}".format(type(exception).__name__, exception,
+                                                                            traceback.format_exc(limit=6).strip()))
+                                        system_info = "not checked"
+                                    okeanos_system_info = "Linux 4.12.14-150.17_5.0.86-cray_ari_s x86_64"
+                                    # See https://docs.python.org/3/library/subprocess.html#subprocess.Popen.returncode
+                                    if not self.okeanos and system_info != okeanos_system_info \
+                                            and system_info != "not checked":
+                                        if sys.platform.startswith("linux"):
+                                            signal_info = subprocess.check_output("kill -l " + str(-return_code),
+                                                                                  shell=True)
+                                        else:
+                                            signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
+                                        signal_name = signal_info.decode().strip().upper()
                                     else:
-                                        signal_info = subprocess.check_output(["kill", "-l", str(-return_code)])
-                                    signal_name = signal_info.decode().strip().upper()
+                                        # "kill -l [number]" on okeanos doesn't work, see /usr/include/asm/signal.h
+                                        # TODO Test it
+                                        if return_code == -10:
+                                            signal_name = "USR1"
+                                        elif return_code == -12:
+                                            signal_name = "USR2"
+                                        else:
+                                            signal_name = str(-return_code)
+                                    warning_message += ", signal name: {}".format(signal_name)
+                                # self.logger.debug(msg=signal_info)
+                                # self.logger.debug(msg=signal_name)
+                                self.logger.warning(msg=warning_message)
+                                random_seed = self.rsa_parameters.get("seedOrigin") == "random" if self.input_given\
+                                    else self.all_rsa_parameters.get("seedOrigin") == "random"
+                                # if return_code_name in ["", "TERM"] or (return_code_name == "USR1"
+                                #                                         and not random_seed):
+                                #     self.logger.warning(msg="Resampling phenotype candidate"
+                                #                             " no. {}".format(str(candidate_num)))
+                                #     new_candidate = self.CMAES.ask(number=1)[0]
+                                #     while not self.arg_in_domain(arg=new_candidate):
+                                #         new_candidate = self.CMAES.ask(number=1)[0]
+                                #     self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
+                                #     self.logger.info(msg=pprint.pformat(new_candidate))
+                                #     pheno_candidates[candidate_num] = new_candidate
+                                #     return_codes[candidate_num] = self.rsa_simulation(candidate_num, new_candidate)
+                                # elif return_code_name == "USR1" and random_seed:
+                                if signal_name == "USR1" and random_seed:
+                                    # To repeat RSA simulation in the same point when random seed RSA parameter is set,
+                                    # kill simulation process with "kill -USR1 pid"
+                                    self.logger.warning(msg="Repeating RSA simulation for phenotype candidate"
+                                                            " no. {}".format(str(candidate_num)))
+                                    return_codes[candidate_num] = self.rsa_simulation(
+                                        candidate_num, candidate,
+                                        omp_threads=self.parallel_threads_number)
+                                elif signal_name == "USR2":
+                                    # To set corresponding to RSA simulation phenotype candidate's value to the median
+                                    # of other candidates' values, kill simulation process with "kill -USR2 pid"
+                                    self.logger.warning(msg="Phenotype candidate's no. {} value will be set"
+                                                            " to the median of other candidates'"
+                                                            " values".format(str(candidate_num)))
+                                    take_median[candidate_num] = True
                                 else:
-                                    # "kill -l [number]" on okeanos doesn't work, see /usr/include/asm/signal.h
-                                    # TODO Test it
-                                    if return_code == -10:
-                                        signal_name = "USR1"
-                                    elif return_code == -12:
-                                        signal_name = "USR2"
-                                    else:
-                                        signal_name = str(-return_code)
-                                warning_message += ", signal name: {}".format(signal_name)
-                            # self.logger.debug(msg=signal_info)
-                            # self.logger.debug(msg=signal_name)
-                            self.logger.warning(msg=warning_message)
-                            random_seed = self.rsa_parameters.get("seedOrigin") == "random" if self.input_given\
-                                else self.all_rsa_parameters.get("seedOrigin") == "random"
-                            # if return_code_name in ["", "TERM"] or (return_code_name == "USR1" and not random_seed):
-                            #     self.logger.warning(msg="Resampling phenotype candidate"
-                            #                             " no. {}".format(str(candidate_num)))
-                            #     new_candidate = self.CMAES.ask(number=1)[0]
-                            #     while not self.arg_in_domain(arg=new_candidate):
-                            #         new_candidate = self.CMAES.ask(number=1)[0]
-                            #     self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
-                            #     self.logger.info(msg=pprint.pformat(new_candidate))
-                            #     pheno_candidates[candidate_num] = new_candidate
-                            #     return_codes[candidate_num] = self.rsa_simulation(candidate_num, new_candidate)
-                            # elif return_code_name == "USR1" and random_seed:
-                            if signal_name == "USR1" and random_seed:
-                                # To repeat RSA simulation in the same point when random seed RSA parameter is set,
-                                # kill simulation process with "kill -USR1 pid"
-                                self.logger.warning(msg="Repeating RSA simulation for phenotype candidate"
-                                                        " no. {}".format(str(candidate_num)))
-                                return_codes[candidate_num] = self.rsa_simulation(
-                                    candidate_num, candidate,
-                                    omp_threads=self.parallel_threads_number)
-                            elif signal_name == "USR2":
-                                # To set corresponding to RSA simulation phenotype candidate's value to the median
-                                # of other candidates' values, kill simulation process with "kill -USR2 pid"
-                                self.logger.warning(msg="Phenotype candidate's no. {} value will be set to the median"
-                                                        " of other candidates' values".format(str(candidate_num)))
-                                take_median[candidate_num] = True
-                            else:
-                                # To resample phenotype candidate corresponding to RSA simulation,
-                                # kill simulation process in other way, e.g. with "kill pid"
-                                self.logger.warning(msg="Resampling phenotype candidate"
-                                                        " no. {}".format(str(candidate_num)))
+                                    # To resample phenotype candidate corresponding to RSA simulation,
+                                    # kill simulation process in other way, e.g. with "kill pid"
+                                    self.logger.warning(msg="Resampling phenotype candidate"
+                                                            " no. {}".format(str(candidate_num)))
+                                    new_candidate = self.CMAES.ask(number=1)[0]
+                                    while not self.arg_in_domain(arg=new_candidate):
+                                        new_candidate = self.CMAES.ask(number=1)[0]
+                                    self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
+                                    self.logger.info(msg=pprint.pformat(new_candidate))
+                                    pheno_candidates[candidate_num] = new_candidate
+                                    return_codes[candidate_num] = self.rsa_simulation(
+                                        candidate_num, new_candidate,
+                                        omp_threads=self.parallel_threads_number)
+
+                        with open(self.output_filename, "r") as rsa_output_file:
+                            # TODO Maybe find more efficient or elegant solution
+                            # TODO Maybe iterate through lines in file in reversed order - results of the current
+                            #  generation should be at the end
+                            for line in rsa_output_file:
+                                evaluation_data = line.split("\t")
+                                evaluation_labels = evaluation_data[0].split(",")
+                                if int(evaluation_labels[0]) == self.CMAES.countiter:
+                                    read_candidate_num = int(evaluation_labels[1])
+                                    mean_packing_fraction = float(evaluation_data[1])
+                                    values[read_candidate_num] = -mean_packing_fraction
+                else:
+                    # TODO Test it
+                    values = np.array(values)
+                    return_codes = np.array(return_codes)
+                    random_seed = self.rsa_parameters.get("seedOrigin") == "random" if self.input_given\
+                        else self.all_rsa_parameters.get("seedOrigin") == "random"
+                    while np.any(np.logical_and(np.isnan(values), np.logical_not(take_median))):
+                        repeat_candidates = np.full(shape=len(pheno_candidates), fill_value=False)
+                        if random_seed:
+                            repeat_candidates = return_codes == -10
+                            repeat_candidates_nums = [str(candidate_num) for candidate_num, repeat
+                                                      in enumerate(repeat_candidates) if repeat]
+                            if np.any(repeat_candidates):
+                                self.logger.warning(msg="Phenotype candidates' no. {} simulations"
+                                                        " will be repeated".format(", ".join(repeat_candidates_nums)))
+                        median_candidates = return_codes == -12
+                        if np.any(median_candidates):
+                            median_candidates_nums = [candidate_num for candidate_num, median
+                                                      in enumerate(median_candidates) if median]
+                            self.logger.warning(msg="Phenotype candidates' no. {} values will be set"
+                                                    " to the median of other candidates'"
+                                                    " values".format(", ".join(map(str, median_candidates_nums))))
+                            take_median[median_candidates] = True
+                        # Resample candidates
+                        resample_candidates = np.logical_and(np.isnan(values),
+                                                             np.logical_not(take_median),
+                                                             np.logical_not(repeat_candidates))
+                        if np.any(resample_candidates):
+                            resample_candidates_nums = [candidate_num for candidate_num, resample
+                                                        in enumerate(resample_candidates) if resample]
+                            resamplings_num = 0
+                            for candidate_num in resample_candidates_nums:
                                 new_candidate = self.CMAES.ask(number=1)[0]
                                 while not self.arg_in_domain(arg=new_candidate):
                                     new_candidate = self.CMAES.ask(number=1)[0]
-                                self.logger.info(msg="Resampled candidate no. {}:".format(str(candidate_num)))
-                                self.logger.info(msg=pprint.pformat(new_candidate))
+                                    resamplings_num += 1
                                 pheno_candidates[candidate_num] = new_candidate
-                                return_codes[candidate_num] = self.rsa_simulation(
-                                    candidate_num, new_candidate,
-                                    omp_threads=self.parallel_threads_number)
-
-                    with open(self.output_filename, "r") as rsa_output_file:
-                        # TODO Maybe find more efficient or elegant solution
-                        # TODO Maybe iterate through lines in file in reversed order - results of the current generation
-                        #  should be at the end
-                        for line in rsa_output_file:
-                            evaluation_data = line.split("\t")
-                            evaluation_labels = evaluation_data[0].split(",")
-                            if int(evaluation_labels[0]) == self.CMAES.countiter:
-                                read_candidate_num = int(evaluation_labels[1])
-                                mean_packing_fraction = float(evaluation_data[1])
-                                values[read_candidate_num] = -mean_packing_fraction
+                            self.logger.warning(msg="Phenotype candidates no. {}"
+                                                    " were resampled.".format(", ".join(map(str,
+                                                                                            resample_candidates_nums))))
+                            if resamplings_num > 0:
+                                self.logger.info(msg="Resamplings per candidate: {}".format(
+                                    resamplings_num / len(resample_candidates_nums)))
+                            self.logger.info(msg="New candidates:")
+                            for candidate_num in resample_candidates_nums:
+                                self.logger.info(msg=pprint.pformat(pheno_candidates[candidate_num]))
+                            if not self.particle_attributes_parallel:
+                                self.logger.info(msg="Computing candidates' particleAttributes parameters in series")
+                                self.logger.debug(msg="Candidates' particleAttributes parameters:")
+                                for candidate_num in resample_candidates_nums:
+                                    cand_particle_attributes[candidate_num] = self.arg_to_particle_attributes(
+                                        pheno_candidates[candidate_num])
+                                    self.logger.debug(msg=cand_particle_attributes[candidate_num])
+                        # Evaluate rest of the candidates
+                        evaluate_candidates = np.logical_and(np.isnan(values), np.logical_not(take_median))
+                        candidates_to_evaluate = [candidate for candidate, evaluate
+                                                  in zip(pheno_candidates, evaluate_candidates) if evaluate]
+                        candidates_numbers = [candidate_num for candidate_num, evaluate
+                                              in enumerate(evaluate_candidates) if evaluate]
+                        self.logger.info(msg="Evaluating values for candidates"
+                                             " no. {}".format(", ".join(map(str, candidates_numbers))))
+                        if self.particle_attributes_parallel:
+                            new_values, new_return_codes = self.run_simulations_on_okeanos(
+                                candidates_to_evaluate,
+                                candidates_numbers=candidates_numbers)
+                        else:
+                            candidates_part_attrs = [part_attrs for part_attrs, evaluate
+                                                     in zip(cand_particle_attributes, evaluate_candidates) if evaluate]
+                            new_values, new_return_codes = self.run_simulations_on_okeanos(
+                                candidates_to_evaluate,
+                                cand_particle_attributes=candidates_part_attrs,
+                                candidates_numbers=candidates_numbers)
+                        # Set values and return codes
+                        values[evaluate_candidates] = new_values
+                        return_codes[evaluate_candidates] = new_return_codes
+                    # values = list(values)
                 if np.any(take_median):
                     # TODO Maybe make evaluate_generation_* methods return values in np.ndarray - then it would be
                     #  easier to manipulate the values array
@@ -2536,6 +3256,7 @@ def resume_optimization() -> None:
     optimization.run()
 
 
+# TODO Maybe read optimization directories' and files' names from a YAML file and use pathlib module
 # TODO Add managing errors of the rsa3d program and forcing recalculation (or max n recalculations) or resampling of
 #  the parameter point (maybe return None immediately after rsa_process.wait() in case of a failure) (old note)
 # TODO Maybe prepare a Makefile like in https://docs.python-guide.org/writing/structure/ and with creating
