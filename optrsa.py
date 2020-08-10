@@ -3218,9 +3218,12 @@ def resume_optimization() -> None:
             optimization.rsa_parameters.update(resume_input["rsa_parameters"])
             if not optimization.input_given:
                 optimization.all_rsa_parameters.update(resume_input["rsa_parameters"])
-        for attr in ["accuracy", "parallel", "particle_attributes_parallel", "okeanos", "max_nodes_number"]:
+        for attr in ["accuracy", "parallel", "particle_attributes_parallel", "okeanos", "max_nodes_number",
+                     "okeanos_parallel", "nodes_number", "collectors_per_task"]:
             if attr in resume_input:
                 setattr(optimization, attr, resume_input[attr])
+        if "min_collectors_number" in resume_input:
+            optimization.min_collectors_number = max(resume_input["min_collectors_number"], 2)
         if "threads" in resume_input:
             optimization.parallel_threads_number = resume_input["threads"]
         if any(attr in resume_input for attr in ["threads", "okeanos", "max_nodes_number"]):
@@ -3232,7 +3235,8 @@ def resume_optimization() -> None:
                                                                optimization.CMAES.popsize) \
                     if optimization.max_nodes_number is not None else optimization.CMAES.popsize
         # TODO Set (and maybe check) other attributes, if needed
-        if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) or "accuracy" in resume_input:
+        if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) or "accuracy" in resume_input\
+                or "okeanos_parallel" in resume_input:
             # All attributes that are used in optimization.rsa_proc_arguments have to be set already, if present
             optimization.set_rsa_proc_arguments()
         # Generate used optimization input file in output directory
@@ -3252,6 +3256,21 @@ def resume_optimization() -> None:
                 rsa_input_file.writelines(["{} = {}\n".format(param_name, param_value)
                                            for param_name, param_value in rsa_parameters.items()])
             optimization.logger.info(msg="Resume RSA input file: {}-rsa-input.txt".format(resume_signature))
+    # If optimization is to be run on Okeanos in parallel mode, try to set nodes_number attribute to the number of nodes
+    # actually allocated to the SLURM job, unless nodes_number was given in resume input file
+    if optimization.okeanos_parallel and (args.file is None or "nodes_number" not in resume_input):
+        slurm_job_num_nodes = os.getenv("SLURM_JOB_NUM_NODES")
+        if slurm_job_num_nodes is not None:
+            optimization.nodes_number = int(slurm_job_num_nodes)
+        else:
+            optimization.logger.warning(msg="Unable to get number of nodes allocated to the job; SLURM_JOB_NUM_NODES"
+                                            " environment variable is not set")
+            if optimization.nodes_number is not None:
+                optimization.logger.warning(msg="Using the previously set value of the nodes_number attribute")
+            else:
+                optimization.logger.warning(msg="Setting the value of the nodes_number attribute to 1 + (population"
+                                                " size)")
+                optimization.nodes_number = 1 + optimization.CMAES.popsize
     # Run optimization
     optimization.run()
 
