@@ -157,6 +157,17 @@ def wolfram_polydisk_area(arg: np.ndarray) -> float:
     return float(area_str)
 
 
+def softplus(x, k: Optional[float] = 1):
+    """
+    Calculate element-wise softplus of the NumPy array_like x argument with "sharpness" parameter k
+
+    :param x: Argument suitable to pass to NumPy functions using array_like arguments
+    :param k: Optional parameter determining "sharpness" of the function, defaults to 1
+    :return: Object of the same type as x, element-wise softplus of x
+    """
+    return np.log(1 + np.exp(k * x)) / k
+
+
 class StreamToLogger:
     """
     Source: https://stackoverflow.com/questions/11124093/redirect-python-print-output-to-logger/11124247
@@ -2863,18 +2874,39 @@ class ConstrXYStarShapedPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, StarShape
     pass
 
 
-class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters,
                                      particleType="RoundedPolygon")
 
     @classmethod
+    @abc.abstractmethod
+    def arg_to_radius_and_polygon_arg(cls, arg: np.ndarray) -> Tuple[float, np.ndarray]:
+        """
+        Function returning tuple containing radius of rounding of the polygon and the polygon argument based on the
+        rounded polygon argument
+        TODO Redact docstring
+        """
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def stddevs_to_radius_and_polygon_stddevs(cls, stddevs: np.ndarray) -> Tuple[float, np.ndarray]:
+        """
+        Function returning tuple containing rounding radius' standard deviation and the polygon argument's standard
+        deviations based on the rounded polygon argument's standard deviations
+        TODO Redact docstring
+        """
+        pass
+
+    @classmethod
     def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
         """Function returning rsa3d program's parameter particleAttributes based on arg"""
-        polygon_particle_attributes = super().arg_to_particle_attributes(arg)
+        radius, polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)
+        polygon_particle_attributes = super().arg_to_particle_attributes(polygon_arg)
         if issubclass(cls, ConvexPolygonRSACMAESOpt):
             # If the polygon is convex, then don't pass its area
-            return "1 " + polygon_particle_attributes
+            return str(radius) + " " + polygon_particle_attributes
         # Extract particle data
         particle_attributes_list = polygon_particle_attributes.split(" ")
         vertices_num = int(particle_attributes_list[0])
@@ -2893,16 +2925,23 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                                           "yet.".format(coordinates_type))
         if ConvexPolygonRSACMAESOpt.select_vertices(coordinates_type="xy", points=part_data).size == vertices_num:
             # If the polygon is convex, then don't pass its area
-            return "1 " + polygon_particle_attributes
+            return str(radius) + " " + polygon_particle_attributes
         else:
             # Polygon is concave, calculate and pass its area
             # Method of calculation valid for simple polygons
             polygon = shapely.geometry.Polygon(shell=part_data)
-            rounded_polygon = polygon.buffer(distance=1, resolution=10 ** 6)
+            rounded_polygon = polygon.buffer(distance=radius, resolution=10 ** 6)
             # For the resolution of 10^6, the relative error for calculation of the unitary disk area approximately
             # equals 4.0 * 10^-13 and the time of this calculation is a few seconds
             area = rounded_polygon.area
-            return " ".join(["1", polygon_particle_attributes, str(area)])
+            return " ".join([str(radius), polygon_particle_attributes, str(area)])
+
+    @classmethod
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
+        radius_stddev, polygon_stddevs = cls.stddevs_to_radius_and_polygon_stddevs(stddevs)
+        polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)[1]
+        polygon_particle_stddevs = super().stddevs_to_particle_stddevs(polygon_arg, polygon_stddevs)
+        return np.insert(polygon_particle_stddevs, 0, radius_stddev)
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
@@ -2910,6 +2949,7 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                       part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
         # Extract particle data
         particle_attributes_list = particle_attributes.split(" ")
+        radius = float(particle_attributes_list[0])
         vertices_num = int(particle_attributes_list[1])
         coordinates_type = particle_attributes_list[2]
         part_data = np.array(particle_attributes_list[3:3 + 2 * vertices_num],
@@ -2928,15 +2968,18 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
             # Degenerate case of initializing mean of the distribution with a sequence of equal points
             sqrt_area = np.sqrt(np.pi)
             disk_center = part_data[0, :] / sqrt_area
-            radius = 1. / sqrt_area
+            radius /= sqrt_area
             if part_std_devs is None:
                 drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * 2 * radius,
                                                                 scaling_factor * 2 * radius,
                                                                 scaling_factor * -(disk_center[0] - radius),
                                                                 scaling_factor * -(disk_center[1] - radius))
             else:
-                points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
+                radius_std_dev, polygon_std_devs = cls.stddevs_to_radius_and_polygon_stddevs(std_devs)
+                points_std_devs = cls.stddevs_to_points_stddevs(polygon_std_devs)
                 points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
+                radius_std_dev /= sqrt_area
+                # TODO Maybe add drawing rounding radius' standard deviation
                 max_x = np.max(np.append(points_std_devs_data[:, 0], radius))
                 max_y = np.max(np.append(points_std_devs_data[:, 1], radius))
                 drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * 2 * max_x,
@@ -2990,8 +3033,10 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
             area = float(particle_attributes_list[-1])
         sqrt_area = np.sqrt(area)
         part_data /= sqrt_area
+        radius /= sqrt_area
         if arg is not None:
-            coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
+            polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)[1]
+            coordinates_type, points_coordinates = cls.arg_to_points_coordinates(polygon_arg)
             # coordinates_type is overwritten, although it should be the same
             if coordinates_type != "xy":
                 conversions = {
@@ -3007,12 +3052,14 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
                                               "implemented yet.".format(coordinates_type))
             points_data = points_coordinates.reshape(-1, 2) / sqrt_area
         if part_std_devs is not None:
-            points_std_devs = cls.stddevs_to_points_stddevs(std_devs)
+            radius_std_dev, polygon_std_devs = cls.stddevs_to_radius_and_polygon_stddevs(std_devs)
+            points_std_devs = cls.stddevs_to_points_stddevs(polygon_std_devs)
             points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
             # std_devs_data = part_std_devs.reshape(-1, 2) / sqrt_area
+            radius_std_dev /= sqrt_area
+            # TODO Maybe add drawing rounding radius' standard deviation
         # Draw particle
         # Get polygon drawing's width and height
-        radius = 1. / sqrt_area
         if part_std_devs is None:
             shown_points_data = points_data if arg is not None else part_data
             x_min = np.min(shown_points_data[:, 0] - radius)
@@ -3079,6 +3126,28 @@ class FixedRadiiRoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCM
         return drawing_area
 
 
+class FixedRadiiRoundedPolygonRSACMAESOpt(RoundedPolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+
+    @classmethod
+    def arg_to_radius_and_polygon_arg(cls, arg: np.ndarray) -> Tuple[float, np.ndarray]:
+        return 1, arg
+
+    @classmethod
+    def stddevs_to_radius_and_polygon_stddevs(cls, stddevs: np.ndarray) -> Tuple[float, np.ndarray]:
+        return 0, stddevs
+
+
+class VariableRadiiRoundedPolygonRSACMAESOpt(RoundedPolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+
+    @classmethod
+    def arg_to_radius_and_polygon_arg(cls, arg: np.ndarray) -> Tuple[float, np.ndarray]:
+        return softplus(arg[0]), arg[1:]
+
+    @classmethod
+    def stddevs_to_radius_and_polygon_stddevs(cls, stddevs: np.ndarray) -> Tuple[float, np.ndarray]:
+        return softplus(stddevs[0]), stddevs[1:]
+
+
 class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
                                                         ConstrXYConvexPolygonRSACMAESOpt):
     pass
@@ -3086,6 +3155,16 @@ class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygon
 
 class ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
                                                             ConstrXYStarShapedPolygonRSACMAESOpt):
+    pass
+
+
+class ConstrXYVariableRadiiRoundedConvexPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
+                                                           ConstrXYConvexPolygonRSACMAESOpt):
+    pass
+
+
+class ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
+                                                               ConstrXYStarShapedPolygonRSACMAESOpt):
     pass
 
 
@@ -3135,11 +3214,34 @@ def optimize() -> None:
         constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(**opt_class_args)
         constr_fixed_radii_polygon_opt.run()
 
+    def opt_constr_variable_radii_star_shaped_polygon() -> None:
+        if optimization_input["opt_mode_args"]["polygon_initial_mean"] == "origin":
+            polygon_initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
+        elif optimization_input["opt_mode_args"]["polygon_initial_mean"] == "regular_polygon":
+            vertices_num = optimization_input["opt_mode_args"]["vertices_num"]
+            polygon_radius = optimization_input["opt_mode_args"]["initial_mean_params"]["polygon_radius"]
+            angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
+            vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([polygon_radius * np.cos(angle),
+                                                                                   polygon_radius * np.sin(angle)]),
+                                                    axis=0,
+                                                    arr=angles).T
+            shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
+            vertices = vertices_centered + np.array([polygon_radius * np.cos(shift_angle),
+                                                     polygon_radius * np.sin(shift_angle)])
+            polygon_initial_mean = vertices.flatten()[:-3]
+        initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
+        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        constr_variable_radii_polygon_opt = ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(**opt_class_args)
+        constr_variable_radii_polygon_opt.run()
+
     opt_modes = {
         "optfixedradii": opt_fixed_radii,
         "optconstrfixedradii": opt_constr_fixed_radii,
         "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon,
-        "optconstrfixedradiistarshapedpolygon": opt_constr_fixed_radii_star_shaped_polygon
+        "optconstrfixedradiistarshapedpolygon": opt_constr_fixed_radii_star_shaped_polygon,
+        "optconstrvariableradiistarshapedpolygon": opt_constr_variable_radii_star_shaped_polygon
     }
     if args.file is None:
         raise TypeError("In optimize mode input file has to be specified using -f argument")
