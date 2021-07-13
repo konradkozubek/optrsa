@@ -1,0 +1,14 @@
+graph_size: [10, 6.5]
+font_size: 12
+drawings_scale: 0.05
+modulo: 5
+worst_position: 0.1
+median_position: 0.2
+best_position: 0.3
+mean_position: 0.95
+bottom_space: 0.35
+top_space: 0.12
+inset_data_x: [70, 100]
+inset_data_y: [0.58, 0.62]
+inset_origin: [0.5, 0.4]
+inset_size: [0.4, 0.3]

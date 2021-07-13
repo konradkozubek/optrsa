@@ -1743,7 +1743,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             save_generation_data()
 
     @classmethod
-    def plot_optimization_data(cls, signature: str, modulo: int = None) -> None:
+    def plot_optimization_data(cls, signature: str, config_file_name: str) -> None:
         opt_data_filename = _output_dir + "/" + signature + "/optimization.dat"
         # Prepare optimization data file if it does not exist
         if not os.path.isfile(opt_data_filename):
@@ -1789,7 +1789,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # Alternatively pass filepath_or_buffer=opt_data_filename to pd.read_table
         with open(opt_data_filename) as opt_data_file:
             optimization_data = pd.read_table(filepath_or_buffer=opt_data_file,
-                                              index_col="generationnum")  # dtype=cls.optimization_data_columns
+                                              index_col="generationnum",
+                                              dtype=cls.optimization_data_columns)
         # Debugging
         # # pd.set_option('display.max_columns', None)
         # # pd.set_option('display.max_rows', None)
@@ -1803,10 +1804,17 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # print(type(optimization_data.loc[0, "bestpartattrs"]))
         # # pprint.pprint(optimization_data.head(1))
 
+        config_file_path = _output_dir + "/" + signature + "/" + config_file_name
+        with open(config_file_path) as config_file:
+            graph_config = yaml.full_load(config_file)
         # TODO Maybe use fig, ax = plt.subplots() and plot on axes
         # fig, ax = plt.subplots()
         # plt.rcParams["axes.autolimit_mode"] = "round_numbers"
-        fig = plt.figure(num=args.signature, figsize=(10, 6.5))  # figsize is given in inches
+        plt.rcParams["text.usetex"] = True
+        plt.rcParams["font.family"] = "serif"
+        plt.rcParams["font.size"] = graph_config["font_size"]
+        fig = plt.figure(num=args.signature, figsize=graph_config["graph_size"])  # figsize is given in inches
+        # (10, 6.5)
         ax = plt.axes()
         # plt.title("CMA-ES optimization of RSA mean packing fraction\nof fixed-radii polydisks")
         plt.ylabel("Mean packing fraction")
@@ -1826,18 +1834,19 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                              fmt="k.", capsize=1.5)  # "ko"
         plt.errorbar(x=optimization_data.index, y=optimization_data["worstpfrac"],
                      yerr=optimization_data["worstpfracstddev"],
-                     fmt="bo-", capsize=2, label="Worst candidate's value")  # barsabove=True
-        plt.errorbar(x=optimization_data.index, y=optimization_data["bestpfrac"],
-                     yerr=optimization_data["bestpfracstddev"],
-                     fmt="go-", capsize=2, label="Best candidate's value")  # barsabove=True
+                     fmt="bo-", capsize=2, label="Worst candidate")  # barsabove=True  # Worst candidate's value
         plt.errorbar(x=optimization_data.index, y=optimization_data["medianpfrac"],
                      yerr=optimization_data["medianpfracstddev"],
-                     fmt="ro-", capsize=2, label="Median candidate's value")  # barsabove=True
+                     fmt="rs-", capsize=2, label="Median candidate")  # barsabove=True
+        plt.errorbar(x=optimization_data.index, y=optimization_data["bestpfrac"],
+                     yerr=optimization_data["bestpfracstddev"],
+                     fmt="gD-", capsize=2, label="Best candidate")  # barsabove=True
         plt.fill_between(optimization_data.index, optimization_data["worstpfrac"], optimization_data["bestpfrac"],
                          color="0.75")
         # plt.grid(axis="y")  # True, axis="y"
         plt.grid()
-        leg = plt.legend()
+        handles, labels = ax.get_legend_handles_labels()
+        leg = plt.legend(reversed(handles), reversed(labels))
         leg.set_draggable(True)
         # After dragging legend disappears, but reappears shifted after changing anything in the graph.
         # update="bbox" does not change this behaviour, but sets legend's position relative to figure, not axes, which
@@ -1846,7 +1855,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         def particle_drawings_annotations(part_attrs_col: str, packing_frac_col: str = "medianpfrac",
                                           color: str = "0.5", modulo: int = 1, drawings_scale: float = 0.05,
                                           drawings_offset: Tuple[float, float] = None, vertical_alignment: float = 0.1,
-                                          position: str = "point", means: bool = False) -> None:
+                                          position: str = "point", arrows: bool = False, means: bool = False) -> None:
             """
             Annotate packing fraction data series with, draggable if necessary, particle drawings
 
@@ -1902,13 +1911,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                      scaling_factor=scaling_factor,
                                                      color=color,
                                                      arg=arg)
-                    arrow_props = dict(arrowstyle="simple,"  # "->", "simple"
-                                                  "head_length=0.2,"
-                                                  "head_width=0.3,"  # 0.1, 0.5
-                                                  "tail_width=0.01",  # 0.2
-                                       facecolor="black",
-                                       connectionstyle="arc3,"
-                                                       "rad=0.3")
                 else:
                     stddevs = np.array(optimization_data["stddevs"].at[gen_num].split(" "), dtype=np.float)
                     part_stddevs = np.array(optimization_data["partstddevs"].at[gen_num].split(" "), dtype=np.float)
@@ -1918,6 +1920,16 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                      arg=arg,
                                                      std_devs=stddevs,
                                                      part_std_devs=part_stddevs)
+                    arrows = False
+                if arrows:
+                    arrow_props = dict(arrowstyle="simple,"  # "->", "simple"
+                                                  "head_length=0.2,"
+                                                  "head_width=0.3,"  # 0.1, 0.5
+                                                  "tail_width=0.01",  # 0.2
+                                       facecolor="black",
+                                       connectionstyle="arc3,"
+                                                       "rad=0.3")
+                else:
                     arrow_props = dict()
                 # Set coordinates and positions of the annotated point and the label with drawing
                 xy = (optimization_data.index[gen_num], optimization_data[packing_frac_col].at[gen_num])
@@ -1976,26 +1988,35 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     # drag_ab = matplotlib.offsetbox.DraggableAnnotation(ab)
 
         data_len = len(optimization_data["bestpartattrs"])
-        drawings_scale = 0.05
+        drawings_scale = graph_config["drawings_scale"]  # 0.05
+        modulo = graph_config.get("modulo")
         if modulo is None:
             modulo = max(int(data_len * drawings_scale), 1)
         particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
-                                      modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.15))
+                                      modulo=modulo, drawings_scale=drawings_scale,
+                                      position="x", vertical_alignment=graph_config["worst_position"])  # 0.1
+        # particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
+        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.15))
         # drawings_offset=(0.1, -0.1) (0.2, -0.3)
         # particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
         #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., 0.1))
         # # drawings_offset = (0.1, 0.1) (0.2, -0.1)
         particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
                                       modulo=modulo, drawings_scale=drawings_scale,
-                                      position="x", vertical_alignment=1.08)
+                                      position="x", vertical_alignment=graph_config["best_position"])  # 0.3
+        # vertical_alignment=1.08
         # particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
         #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
         # # drawings_offset=(0.1, 0.) (0.2, -0.2)
         particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
                                       modulo=modulo, drawings_scale=drawings_scale,
-                                      position="x", vertical_alignment=0.22)
+                                      position="x", vertical_alignment=graph_config["median_position"])  # 0.2
+        # vertical_alignment=0.22
         particle_drawings_annotations(part_attrs_col="meanpartattrs",
-                                      modulo=modulo, drawings_scale=drawings_scale, position="x", means=True)
+                                      modulo=modulo, drawings_scale=drawings_scale,
+                                      position="x", vertical_alignment=graph_config["mean_position"], means=True)
+        # 0.9  # 0.95
+        # vertical_alignment=0.1
         gen_nums = list(range(0, data_len, modulo))
         if data_len - 1 not in gen_nums:
             gen_nums.append(data_len - 1)
@@ -2005,8 +2026,42 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         plt.locator_params(axis="y", nbins=15)
         # ax.set_xlim(...)
         bottom_lim, top_lim = ax.get_ylim()
-        bottom_space = 0.3
-        ax.set_ylim(bottom_lim - bottom_space / (1. - bottom_space) * (top_lim - bottom_lim), top_lim)
+        bottom_space = graph_config["bottom_space"]  # 0.35
+        top_space = graph_config["top_space"]  # 0.12
+        ax.set_ylim(bottom_lim - bottom_space / (1. - top_space - bottom_space) * (top_lim - bottom_lim),
+                    top_lim + top_space / (1. - top_space - bottom_space) * (top_lim - bottom_lim))
+        # ax.set_ylim(bottom_lim - bottom_space / (1. - bottom_space) * (top_lim - bottom_lim), top_lim)
+
+        # Create inset graph
+        inset_ax = ax.inset_axes(graph_config["inset_origin"] + graph_config["inset_size"])
+        inset_ax.set_xlim([graph_config["inset_data_x"][0] - 0.5, graph_config["inset_data_x"][1] + 0.5])
+        inset_ax.set_ylim(graph_config["inset_data_y"])
+        ax.indicate_inset_zoom(inset_ax, edgecolor="black")
+        inset_ax.tick_params(direction="in", right=True, top=True)
+        inset_optimization_data = optimization_data[graph_config["inset_data_x"][0]:graph_config["inset_data_x"][1] + 1]
+        inset_candidates_data = [np.array(gen_cands_data.split(","), dtype=np.float).reshape(-1, 3)
+                                 for gen_cands_data in inset_optimization_data["candidatesdata"]]
+        for gen_num, gen_cands_data in enumerate(inset_candidates_data):
+            for cand_data in reversed(gen_cands_data[1:-1]):
+                # Best and worst candidates are removed, median candidate stays, but his point is later covered
+                inset_ax.errorbar(x=inset_optimization_data.index[gen_num], y=cand_data[1], yerr=cand_data[2],
+                                  fmt="k.", capsize=1.5)  # "ko"
+        inset_ax.errorbar(x=inset_optimization_data.index, y=inset_optimization_data["worstpfrac"],
+                          yerr=inset_optimization_data["worstpfracstddev"],
+                          fmt="bo-", capsize=2, label="Worst candidate")  # barsabove=True
+        inset_ax.errorbar(x=inset_optimization_data.index, y=inset_optimization_data["medianpfrac"],
+                          yerr=inset_optimization_data["medianpfracstddev"],
+                          fmt="rs-", capsize=2, label="Median candidate")  # barsabove=True
+        inset_ax.errorbar(x=inset_optimization_data.index, y=inset_optimization_data["bestpfrac"],
+                          yerr=inset_optimization_data["bestpfracstddev"],
+                          fmt="gD-", capsize=2, label="Best candidate")  # barsabove=True
+        inset_ax.fill_between(inset_optimization_data.index, inset_optimization_data["worstpfrac"],
+                              inset_optimization_data["bestpfrac"], color="0.75")
+        # inset_ax.grid(axis="y")  # True, axis="y"
+        inset_ax.locator_params(axis="x", nbins=graph_config["inset_x_ticks"])
+        inset_ax.locator_params(axis="y", nbins=graph_config["inset_y_ticks"])
+        inset_ax.grid()
+
         plt.show()
 
     @waiting_for_graphs
@@ -2874,6 +2929,10 @@ class ConstrXYStarShapedPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, StarShape
     pass
 
 
+class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
+    pass
+
+
 class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters,
@@ -2966,7 +3025,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                           "yet.".format(coordinates_type))
         if np.all(part_data == part_data[0, :]):
             # Degenerate case of initializing mean of the distribution with a sequence of equal points
-            sqrt_area = np.sqrt(np.pi)
+            sqrt_area = np.sqrt(np.pi) * radius
             disk_center = part_data[0, :] / sqrt_area
             radius /= sqrt_area
             if part_std_devs is None:
@@ -3027,7 +3086,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                     / np.linalg.norm(triangle_side_vec)
                 angle = np.arccos(triangle_height / np.linalg.norm(first_segment_vec)) \
                     + np.arccos(triangle_height / np.linalg.norm(second_segment_vec))
-                area += np.linalg.norm(first_segment_vec) + (np.pi - angle) / 2.
+                area += radius * (np.linalg.norm(first_segment_vec) + radius * (np.pi - angle) / 2.)
         else:
             # Area is given in the particleAttributes parameter
             area = float(particle_attributes_list[-1])
@@ -3084,23 +3143,23 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
         if part_std_devs is None:
             for point_num, point_args in enumerate(shown_points_data):
                 is_vertex = np.any([np.allclose(point_args, vertex_args) for vertex_args in part_data])
-                point_label = matplotlib.text.Text(x=scaling_factor * point_args[0],
-                                                   y=scaling_factor * point_args[1],
-                                                   text=str(point_num),
-                                                   horizontalalignment="center",
-                                                   verticalalignment="center",
-                                                   fontsize=11 if is_vertex else 9,
-                                                   fontweight="normal" if is_vertex else "bold")
-                drawing_area.add_artist(point_label)
+                # point_label = matplotlib.text.Text(x=scaling_factor * point_args[0],
+                #                                    y=scaling_factor * point_args[1],
+                #                                    text=str(point_num),
+                #                                    horizontalalignment="center",
+                #                                    verticalalignment="center",
+                #                                    fontsize=11 if is_vertex else 9,
+                #                                    fontweight="normal" if is_vertex else "bold")
+                # drawing_area.add_artist(point_label)
         else:
             for point_num, point_args in enumerate(points_data):
-                point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
-                                                   y=scaling_factor * point_args[1] + scaling_factor / 10,
-                                                   text=str(point_num),
-                                                   horizontalalignment="center",
-                                                   verticalalignment="center",
-                                                   fontsize=9)
-                drawing_area.add_artist(point_label)
+                # point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
+                #                                    y=scaling_factor * point_args[1] + scaling_factor / 10,
+                #                                    text=str(point_num),
+                #                                    horizontalalignment="center",
+                #                                    verticalalignment="center",
+                #                                    fontsize=9)
+                # drawing_area.add_artist(point_label)
                 # TODO Maybe add dots marking the positions of the points, especially the point(s) with 0 standard
                 #  deviations
 
@@ -3259,8 +3318,8 @@ def plot_cmaes_optimization_data() -> None:
     # If the class is not in current module, module's name has to be passed as sys.modules dictionary's key,
     # so such classes should put the module name to optimization signature.
     opt_class = getattr(sys.modules[__name__], opt_class_name)
-    modulo = int(args.modulo) if args.modulo is not None else None
-    opt_class.plot_optimization_data(signature=args.signature, modulo=modulo)
+    config_file_name = args.config if args.config is not None else "graph_config.yaml"
+    opt_class.plot_optimization_data(signature=args.signature, config_file_name=config_file_name)
 
 
 def resume_optimization() -> None:
@@ -3417,8 +3476,10 @@ if __name__ == '__main__':
     # TODO Make this argument obligatory for plotcmaesoptdata mode
     arg_parser.add_argument("-s", "--signature", help="optimization signature - name of subdirectory of ./output")
     # TODO Make this argument available only in plotcmaesoptdata mode
-    arg_parser.add_argument("-m", "--modulo", help="Annotate points with particles drawings in first, last and every"
-                                                   " modulo generation. If not given,"
-                                                   " modulo will be automatically adjusted.")
+    # arg_parser.add_argument("-m", "--modulo", help="Annotate points with particles drawings in first, last and every"
+    #                                                " modulo generation. If not given,"
+    #                                                " modulo will be automatically adjusted.")
+    # TODO Make this argument available only in plotcmaesoptdata mode
+    arg_parser.add_argument("-c", "--config", help="name of graph configuration YAML file from optimization directory")
     args = arg_parser.parse_args()
     module_modes[args.mode]()
