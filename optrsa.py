@@ -168,6 +168,19 @@ def softplus(x, k: Optional[float] = 1):
     return np.log(1 + np.exp(k * x)) / k
 
 
+def logistic(x, min: Optional[float] = 0, max: Optional[float] = 1, k: Optional[float] = 1):
+    """
+    Calculate element-wise logistic function of the NumPy array_like x argument with "sharpness" parameter k
+
+    :param x: Argument suitable to pass to NumPy functions using array_like arguments
+    :param min: Optional parameter defining left asymptote of the function, defaults to 0
+    :param max: Optional parameter defining right asymptote of the function, defaults to 1
+    :param k: Optional parameter determining "sharpness" of the function, defaults to 1
+    :return: Object of the same type as x, element-wise logistic function of x
+    """
+    return min + (max - min) / (1 + np.exp(-k * x))
+
+
 class StreamToLogger:
     """
     Source: https://stackoverflow.com/questions/11124093/redirect-python-print-output-to-logger/11124247
@@ -2678,7 +2691,7 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         """
         Function selecting polygon's vertices from points returned by the arg_to_points_coordinates method. Given
         a NumPy ndarray of shape (n, 2) with points' coordinates, it returns indices of the subsequent polygon's
-        vertices in a NumPy ndarray of shape (1,) with integers
+        vertices in a NumPy ndarray of shape (n,) with integers
         """
         pass
 
@@ -2930,7 +2943,77 @@ class ConstrXYStarShapedPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, StarShape
 
 
 class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
-    pass
+
+    min_radial_coordinate: float
+    max_radial_coordinate: float
+
+    def __init__(self,
+                 initial_mean: np.ndarray = None,
+                 initial_stddevs: float = None,
+                 cma_options: dict = None,
+                 rsa_parameters: dict = None,
+                 accuracy: float = 0.001,
+                 parallel: bool = True,
+                 threads: int = None,
+                 particle_attributes_parallel: bool = False,
+                 okeanos: bool = False,
+                 max_nodes_number: int = None,
+                 okeanos_parallel: bool = False,
+                 nodes_number: int = None,
+                 min_collectors_number: int = 10,
+                 collectors_per_task: int = 1,
+                 input_rel_path: str = None,
+                 output_to_file: bool = True,
+                 output_to_stdout: bool = False,
+                 log_generations: bool = True,
+                 show_graph: bool = False,
+                 signature_suffix: str = None,
+                 optimization_input: dict = None,
+                 min_radial_coordinate: float = 10,
+                 max_radial_coordinate: float = 50) -> None:
+
+        self.__class__.min_radial_coordinate = min_radial_coordinate
+        self.__class__.max_radial_coordinate = max_radial_coordinate
+
+        super().__init__(initial_mean,
+                         initial_stddevs,
+                         cma_options,
+                         rsa_parameters,
+                         accuracy,
+                         parallel,
+                         threads,
+                         particle_attributes_parallel,
+                         okeanos,
+                         max_nodes_number,
+                         okeanos_parallel,
+                         nodes_number,
+                         min_collectors_number,
+                         collectors_per_task,
+                         input_rel_path,
+                         output_to_file,
+                         output_to_stdout,
+                         log_generations,
+                         show_graph,
+                         signature_suffix,
+                         optimization_input)
+
+    def get_arg_signature(self) -> str:
+        return "vertices-" + str(self.initial_mean.size) + "-initstds-" + str(self.initial_stddevs)
+
+    @classmethod
+    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
+        return np.arange(points.shape[0])
+
+    @classmethod
+    def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+        radial_coordinates = logistic(arg, cls.min_radial_coordinate, cls.max_radial_coordinate)
+        azimuthal_coordinates = np.linspace(start=0, stop=2 * np.pi, num=arg.size, endpoint=False)
+        return "rt", np.stack((radial_coordinates, azimuthal_coordinates), axis=1).flatten()
+
+    @classmethod
+    def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+        points_stddevs = logistic(stddevs, cls.min_radial_coordinate, cls.max_radial_coordinate)
+        return np.stack((points_stddevs, np.zeros_like(stddevs)), axis=1).flatten()
 
 
 class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -3227,6 +3310,11 @@ class ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(VariableRadiiRoun
     pass
 
 
+class VariableRadiiRoundedUniformTPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
+                                                     UniformTPolygonRSACMAESOpt):
+    pass
+
+
 def optimize() -> None:
 
     def opt_fixed_radii() -> None:
@@ -3295,12 +3383,23 @@ def optimize() -> None:
         constr_variable_radii_polygon_opt = ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(**opt_class_args)
         constr_variable_radii_polygon_opt.run()
 
+    def opt_variable_radii_uniform_t_polygon() -> None:
+        polygon_initial_mean = np.zeros(optimization_input["opt_mode_args"]["vertices_num"])
+        initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
+        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        constr_fixed_radii_polygon_opt = VariableRadiiRoundedUniformTPolygonRSACMAESOpt(**opt_class_args)
+        constr_fixed_radii_polygon_opt.run()
+
+
     opt_modes = {
         "optfixedradii": opt_fixed_radii,
         "optconstrfixedradii": opt_constr_fixed_radii,
         "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon,
         "optconstrfixedradiistarshapedpolygon": opt_constr_fixed_radii_star_shaped_polygon,
-        "optconstrvariableradiistarshapedpolygon": opt_constr_variable_radii_star_shaped_polygon
+        "optconstrvariableradiistarshapedpolygon": opt_constr_variable_radii_star_shaped_polygon,
+        "optvariableradiiuniformtpolygon": opt_variable_radii_uniform_t_polygon,
     }
     if args.file is None:
         raise TypeError("In optimize mode input file has to be specified using -f argument")
