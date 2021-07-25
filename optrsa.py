@@ -327,7 +327,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  log_generations: bool = True,
                  show_graph: bool = False,
                  signature_suffix: str = None,
-                 optimization_input: dict = None) -> None:
+                 optimization_input: dict = None,
+                 # Keyword arguments are captured to receive unnecessary passed, ignored optimization class attributes
+                 **kwargs
+                 ) -> None:
 
         self.initial_mean = initial_mean
         self.initial_stddevs = initial_stddevs
@@ -2970,7 +2973,9 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
     max_radial_coordinate_optclattr: float = None
 
     def get_arg_signature(self) -> str:
-        return "vertices-" + str(self.initial_mean.size) + "-initstds-" + str(self.initial_stddevs)
+        return "vertices-" + str(self.initial_mean.size - 1) + "-initstds-" + str(self.initial_stddevs) \
+               + "-inr-" + str(self.min_radial_coordinate_optclattr) \
+               + "-outr-" + str(self.max_radial_coordinate_optclattr)
 
     @classmethod
     def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
