@@ -39,6 +39,7 @@ import pandas as pd
 from typing import Callable, Tuple, Union, List, Optional
 from collections import namedtuple
 import abc
+import inspect
 import io
 import os
 import glob
@@ -348,6 +349,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.show_graph = show_graph
         self.optimization_input = optimization_input
 
+        self.set_optimization_class_attributes(optimization_input=self.optimization_input)
+
         # Set optimization signature
         self.signature = datetime.datetime.now().isoformat(timespec="milliseconds")  # Default timezone is right
         self.signature += "-" + type(self).__name__
@@ -579,6 +582,24 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         #  termination condition and resume optimization - probably run method will work fine
 
     @classmethod
+    def set_optimization_class_attributes(cls, signature: Optional[str] = None,
+                                          optimization_input: Optional[dict] = None):
+        if optimization_input is None:
+            # Get optimization input data from optimization directory
+            with open(_output_dir + "/" + signature + "/optimization-input.json", "r") as opt_input_file:
+                # TODO Maybe use configparser module or YAML format instead
+                optimization_input = json.load(opt_input_file)
+
+        # Set optimization class attibutes (class attributes with suffix "_optclattr") using optimization input data
+        # Based on https://www.geeksforgeeks.org/how-to-get-a-list-of-class-attributes-in-python/
+        suffix = "_optclattr"
+        # Get pairs (member, value) for current optimization class
+        for member in inspect.getmembers(cls):
+            if member[0].endswith(suffix) and not (member[0].startswith("_") or inspect.ismethod(member[1])):
+                attr_name = member[0][:-len(suffix)]
+                setattr(cls, member[0], optimization_input["opt_class_args"][attr_name])
+
+    @classmethod
     @abc.abstractmethod
     def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
         """Function returning rsa3d program's parameter particleAttributes based on arg"""
@@ -596,6 +617,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         Function returning particle attributes' standard deviations based on standard deviations (and possibly mean
         coordinates) in optimization's space
         """
+        # TODO Check, how standard deviations should be transformed
         pass
 
     @classmethod
@@ -2944,58 +2966,8 @@ class ConstrXYStarShapedPolygonRSACMAESOpt(ConstrXYPolygonRSACMAESOpt, StarShape
 
 class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
-    min_radial_coordinate: float
-    max_radial_coordinate: float
-
-    def __init__(self,
-                 initial_mean: np.ndarray = None,
-                 initial_stddevs: float = None,
-                 cma_options: dict = None,
-                 rsa_parameters: dict = None,
-                 accuracy: float = 0.001,
-                 parallel: bool = True,
-                 threads: int = None,
-                 particle_attributes_parallel: bool = False,
-                 okeanos: bool = False,
-                 max_nodes_number: int = None,
-                 okeanos_parallel: bool = False,
-                 nodes_number: int = None,
-                 min_collectors_number: int = 10,
-                 collectors_per_task: int = 1,
-                 input_rel_path: str = None,
-                 output_to_file: bool = True,
-                 output_to_stdout: bool = False,
-                 log_generations: bool = True,
-                 show_graph: bool = False,
-                 signature_suffix: str = None,
-                 optimization_input: dict = None,
-                 min_radial_coordinate: float = 10,
-                 max_radial_coordinate: float = 50) -> None:
-
-        self.__class__.min_radial_coordinate = min_radial_coordinate
-        self.__class__.max_radial_coordinate = max_radial_coordinate
-
-        super().__init__(initial_mean,
-                         initial_stddevs,
-                         cma_options,
-                         rsa_parameters,
-                         accuracy,
-                         parallel,
-                         threads,
-                         particle_attributes_parallel,
-                         okeanos,
-                         max_nodes_number,
-                         okeanos_parallel,
-                         nodes_number,
-                         min_collectors_number,
-                         collectors_per_task,
-                         input_rel_path,
-                         output_to_file,
-                         output_to_stdout,
-                         log_generations,
-                         show_graph,
-                         signature_suffix,
-                         optimization_input)
+    min_radial_coordinate_optclattr: float = None
+    max_radial_coordinate_optclattr: float = None
 
     def get_arg_signature(self) -> str:
         return "vertices-" + str(self.initial_mean.size) + "-initstds-" + str(self.initial_stddevs)
@@ -3006,14 +2978,15 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     @classmethod
     def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
-        radial_coordinates = logistic(arg, cls.min_radial_coordinate, cls.max_radial_coordinate)
+        radial_coordinates = logistic(arg, cls.min_radial_coordinate_optclattr, cls.max_radial_coordinate_optclattr)
         azimuthal_coordinates = np.linspace(start=0, stop=2 * np.pi, num=arg.size, endpoint=False)
-        return "rt", np.stack((radial_coordinates, azimuthal_coordinates), axis=1).flatten()
+        return "rt", np.stack((radial_coordinates, azimuthal_coordinates), axis=1)
 
     @classmethod
     def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
-        points_stddevs = logistic(stddevs, cls.min_radial_coordinate, cls.max_radial_coordinate)
-        return np.stack((points_stddevs, np.zeros_like(stddevs)), axis=1).flatten()
+        # TODO Correct this transformation
+        points_stddevs = logistic(stddevs, cls.min_radial_coordinate_optclattr, cls.max_radial_coordinate_optclattr)
+        return np.stack((points_stddevs, np.zeros_like(stddevs)), axis=1)
 
 
 class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -3119,6 +3092,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
             else:
                 radius_std_dev, polygon_std_devs = cls.stddevs_to_radius_and_polygon_stddevs(std_devs)
                 points_std_devs = cls.stddevs_to_points_stddevs(polygon_std_devs)
+                # TODO t coordinate's (angle's) standard deviation should not be scaled
                 points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
                 radius_std_dev /= sqrt_area
                 # TODO Maybe add drawing rounding radius' standard deviation
@@ -3129,25 +3103,45 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                                                 scaling_factor * -(disk_center[0] - max_x),
                                                                 scaling_factor * -(disk_center[1] - max_y))
             disk = matplotlib.patches.Circle((scaling_factor * disk_center[0], scaling_factor * disk_center[1]),
-                                             scaling_factor * radius,
-                                             color=color)
+                                              scaling_factor * radius,
+                                              color=color)
             drawing_area.add_artist(disk)
             if part_std_devs is not None:
-                arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
+                arrow_style = matplotlib.patches.ArrowStyle("|-|", widthA=0, widthB=1.0)
                 center = (scaling_factor * disk_center[0], scaling_factor * disk_center[1])
-                for point_num in range(len(points_std_devs_data)):
-                    ticks = [(center[0] + scaling_factor * points_std_devs_data[point_num][0], center[1]),
-                             (center[0] - scaling_factor * points_std_devs_data[point_num][0], center[1]),
-                             (center[0], center[1] + scaling_factor * points_std_devs_data[point_num][1]),
-                             (center[0], center[1] - scaling_factor * points_std_devs_data[point_num][1])]
-                    for tick in ticks:
-                        std_dev_arrow = matplotlib.patches.FancyArrowPatch(
-                            center,
-                            tick,
-                            arrowstyle=arrow_style,
-                            shrinkA=0,
-                            shrinkB=0)
-                        drawing_area.add_artist(std_dev_arrow)
+                if coordinates_type == "xy":
+                    for point_std_dev in points_std_devs_data:
+                        ticks = [(center[0] + scaling_factor * point_std_dev[0], center[1]),
+                                 (center[0] - scaling_factor * point_std_dev[0], center[1]),
+                                 (center[0], center[1] + scaling_factor * point_std_dev[1]),
+                                 (center[0], center[1] - scaling_factor * point_std_dev[1])]
+                        for tick in ticks:
+                            std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                                center,
+                                tick,
+                                arrowstyle=arrow_style,
+                                shrinkA=0,
+                                shrinkB=0)
+                            drawing_area.add_artist(std_dev_arrow)
+                elif coordinates_type == "rt":
+                    center_r = np.sqrt(center[0] * center[0] + center[1] * center[1])
+                    for point_std_dev in points_std_devs_data:
+                        arrow_r = (scaling_factor * point_std_dev[0] * center[0] / center_r,
+                                   scaling_factor * point_std_dev[0] * center[1] / center_r)
+                        arrow_t = (scaling_factor * point_std_dev[1] * center[1] / center_r,
+                                   -scaling_factor * point_std_dev[1] * center[0] / center_r)
+                        ticks = [(center[0] + arrow_r[0], center[1] + arrow_r[1]),
+                                 (center[0] - arrow_r[0], center[1] - arrow_r[1]),
+                                 (center[0] + arrow_t[0], center[1] + arrow_t[1]),
+                                 (center[0] - arrow_t[0], center[1] - arrow_t[1])]
+                        for tick in ticks:
+                            std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                                center,
+                                tick,
+                                arrowstyle=arrow_style,
+                                shrinkA=0,
+                                shrinkB=0)
+                            drawing_area.add_artist(std_dev_arrow)
             return drawing_area
         # Calculate particle area
         if issubclass(cls, ConvexPolygonRSACMAESOpt) \
@@ -3210,10 +3204,34 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
             y_max = np.max(shown_points_data[:, 1] + radius)
         else:
             # If part_std_devs are given, arg and std_devs should also be given
-            x_min = np.min(np.concatenate((points_data[:, 0] - radius, points_data[:, 0] - points_std_devs_data[:, 0])))
-            x_max = np.max(np.concatenate((points_data[:, 0] + radius, points_data[:, 0] + points_std_devs_data[:, 0])))
-            y_min = np.min(np.concatenate((points_data[:, 1] - radius, points_data[:, 1] - points_std_devs_data[:, 1])))
-            y_max = np.max(np.concatenate((points_data[:, 1] + radius, points_data[:, 1] + points_std_devs_data[:, 1])))
+            if coordinates_type == "xy":
+                x_min = np.min(np.concatenate((points_data[:, 0] - radius,
+                                               points_data[:, 0] - points_std_devs_data[:, 0])))
+                x_max = np.max(np.concatenate((points_data[:, 0] + radius,
+                                               points_data[:, 0] + points_std_devs_data[:, 0])))
+                y_min = np.min(np.concatenate((points_data[:, 1] - radius,
+                                               points_data[:, 1] - points_std_devs_data[:, 1])))
+                y_max = np.max(np.concatenate((points_data[:, 1] + radius,
+                                               points_data[:, 1] + points_std_devs_data[:, 1])))
+            elif coordinates_type == "rt":
+                arrows_list = []
+                for point_num, point in enumerate(points_data):
+                    point_r = np.sqrt(point[0] * point[0] + point[1] * point[1])
+                    arrow_r = (points_std_devs_data[point_num][0] * point[0] / point_r,
+                               points_std_devs_data[point_num][0] * point[1] / point_r)
+                    arrow_t = (points_std_devs_data[point_num][1] * point[1] / point_r,
+                               -points_std_devs_data[point_num][1] * point[0] / point_r)
+                    ticks = [(point[0] + arrow_r[0], point[1] + arrow_r[1]),
+                             (point[0] - arrow_r[0], point[1] - arrow_r[1]),
+                             (point[0] + arrow_t[0], point[1] + arrow_t[1]),
+                             (point[0] - arrow_t[0], point[1] - arrow_t[1])]
+                    arrows_list.extend(ticks)
+                arrows = np.array(arrows_list)
+
+                x_min = np.min(np.concatenate((points_data[:, 0] - radius, arrows[:, 0])))
+                x_max = np.max(np.concatenate((points_data[:, 0] + radius, arrows[:, 0])))
+                y_min = np.min(np.concatenate((points_data[:, 1] - radius, arrows[:, 1])))
+                y_max = np.max(np.concatenate((points_data[:, 1] + radius, arrows[:, 1])))
         drawing_area = matplotlib.offsetbox.DrawingArea(scaling_factor * (x_max - x_min),
                                                         scaling_factor * (y_max - y_min),
                                                         scaling_factor * -x_min,
@@ -3224,47 +3242,79 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                              joinstyle="round", capstyle="round", color=color)
         drawing_area.add_artist(polygon)
         if part_std_devs is None:
-            for point_num, point_args in enumerate(shown_points_data):
-                is_vertex = np.any([np.allclose(point_args, vertex_args) for vertex_args in part_data])
-                # point_label = matplotlib.text.Text(x=scaling_factor * point_args[0],
-                #                                    y=scaling_factor * point_args[1],
-                #                                    text=str(point_num),
-                #                                    horizontalalignment="center",
-                #                                    verticalalignment="center",
-                #                                    fontsize=11 if is_vertex else 9,
-                #                                    fontweight="normal" if is_vertex else "bold")
-                # drawing_area.add_artist(point_label)
+            pass
+            # for point_num, point_args in enumerate(shown_points_data):
+            #     is_vertex = np.any([np.allclose(point_args, vertex_args) for vertex_args in part_data])
+            #     point_label = matplotlib.text.Text(x=scaling_factor * point_args[0],
+            #                                        y=scaling_factor * point_args[1],
+            #                                        text=str(point_num),
+            #                                        horizontalalignment="center",
+            #                                        verticalalignment="center",
+            #                                        fontsize=11 if is_vertex else 9,
+            #                                        fontweight="normal" if is_vertex else "bold")
+            #     drawing_area.add_artist(point_label)
         else:
-            for point_num, point_args in enumerate(points_data):
-                # point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
-                #                                    y=scaling_factor * point_args[1] + scaling_factor / 10,
-                #                                    text=str(point_num),
-                #                                    horizontalalignment="center",
-                #                                    verticalalignment="center",
-                #                                    fontsize=9)
-                # drawing_area.add_artist(point_label)
-                # TODO Maybe add dots marking the positions of the points, especially the point(s) with 0 standard
-                #  deviations
+            if coordinates_type == "xy":
+                for point_num, point_args in enumerate(points_data):
+                    # point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
+                    #                                    y=scaling_factor * point_args[1] + scaling_factor / 10,
+                    #                                    text=str(point_num),
+                    #                                    horizontalalignment="center",
+                    #                                    verticalalignment="center",
+                    #                                    fontsize=9)
+                    # drawing_area.add_artist(point_label)
+                    # TODO Maybe add dots marking the positions of the points, especially the point(s) with 0 standard
+                    #  deviations
 
-                # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)  # Causes a bug in matplotlib
-                # arrow_style = matplotlib.patches.ArrowStyle("->", head_width=0.8)
-                # Head lengths are not scaled and for small standard deviations heads are longer than arrow, so one
-                # solution is to make them not visible
+                    # arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
+                    arrow_style = matplotlib.patches.ArrowStyle("|-|", widthA=0, widthB=1.0)
+                    # arrow_style = matplotlib.patches.ArrowStyle("simple", head_width=1.2)  # Causes a bug in matplotlib
+                    # arrow_style = matplotlib.patches.ArrowStyle("->", head_width=0.8)
+                    # Head lengths are not scaled and for small standard deviations heads are longer than arrow, so one
+                    # solution is to make them not visible
+                    # TODO Make arrows lengths correct while using arrows without heads
+                    center = (scaling_factor * point_args[0], scaling_factor * point_args[1])
+                    ticks = [(center[0] + scaling_factor * points_std_devs_data[point_num][0], center[1]),
+                             (center[0] - scaling_factor * points_std_devs_data[point_num][0], center[1]),
+                             (center[0], center[1] + scaling_factor * points_std_devs_data[point_num][1]),
+                             (center[0], center[1] - scaling_factor * points_std_devs_data[point_num][1])]
+                    for tick in ticks:
+                        std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                            center,
+                            tick,
+                            arrowstyle=arrow_style,
+                            shrinkA=0,
+                            shrinkB=0)
+                        drawing_area.add_artist(std_dev_arrow)
+            elif coordinates_type == "rt":
                 # TODO Make arrows lengths correct while using arrows without heads
-                arrow_style = matplotlib.patches.ArrowStyle("->", head_length=0.)
-                center = (scaling_factor * point_args[0], scaling_factor * point_args[1])
-                ticks = [(center[0] + scaling_factor * points_std_devs_data[point_num][0], center[1]),
-                         (center[0] - scaling_factor * points_std_devs_data[point_num][0], center[1]),
-                         (center[0], center[1] + scaling_factor * points_std_devs_data[point_num][1]),
-                         (center[0], center[1] - scaling_factor * points_std_devs_data[point_num][1])]
-                for tick in ticks:
-                    std_dev_arrow = matplotlib.patches.FancyArrowPatch(
-                        center,
-                        tick,
-                        arrowstyle=arrow_style,
-                        shrinkA=0,
-                        shrinkB=0)
-                    drawing_area.add_artist(std_dev_arrow)
+                for point_num, point_args in enumerate(points_data):
+                    # point_label = matplotlib.text.Text(x=scaling_factor * point_args[0] + scaling_factor / 10,
+                    #                                    y=scaling_factor * point_args[1] + scaling_factor / 10,
+                    #                                    text=str(point_num),
+                    #                                    horizontalalignment="center",
+                    #                                    verticalalignment="center",
+                    #                                    fontsize=9)
+                    # drawing_area.add_artist(point_label)
+                    # TODO Maybe add dots marking the positions of the points, especially the point(s) with 0 standard
+                    #  deviations
+                    disk = matplotlib.patches.Circle(
+                        (scaling_factor * point_args[0], scaling_factor * point_args[1]),
+                        scaling_factor * 0.03,
+                        color="k")
+                    drawing_area.add_artist(disk)
+
+                    arrow_style = matplotlib.patches.ArrowStyle("|-|", widthA=0, widthB=1.0)
+                    center = (scaling_factor * point_args[0], scaling_factor * point_args[1])
+                    for tick in scaling_factor * arrows[4 * point_num:4 * point_num + 4]:
+                        std_dev_arrow = matplotlib.patches.FancyArrowPatch(
+                            center,
+                            tick,
+                            arrowstyle=arrow_style,
+                            shrinkA=0,
+                            shrinkB=0)
+                        drawing_area.add_artist(std_dev_arrow)
+                    
         return drawing_area
 
 
@@ -3287,6 +3337,7 @@ class VariableRadiiRoundedPolygonRSACMAESOpt(RoundedPolygonRSACMAESOpt, metaclas
 
     @classmethod
     def stddevs_to_radius_and_polygon_stddevs(cls, stddevs: np.ndarray) -> Tuple[float, np.ndarray]:
+        # TODO Correct this transformation
         return softplus(stddevs[0]), stddevs[1:]
 
 
@@ -3417,6 +3468,7 @@ def plot_cmaes_optimization_data() -> None:
     # If the class is not in current module, module's name has to be passed as sys.modules dictionary's key,
     # so such classes should put the module name to optimization signature.
     opt_class = getattr(sys.modules[__name__], opt_class_name)
+    opt_class.set_optimization_class_attributes(signature=args.signature)
     config_file_name = args.config if args.config is not None else "graph_config.yaml"
     opt_class.plot_optimization_data(signature=args.signature, config_file_name=config_file_name)
 
