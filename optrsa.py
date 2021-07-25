@@ -328,7 +328,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  show_graph: bool = False,
                  signature_suffix: str = None,
                  optimization_input: dict = None,
-                 # Keyword arguments are captured to receive unnecessary passed, ignored optimization class attributes
+                 # Keyword arguments are captured to receive unnecessarily passed, ignored optimization class attributes
                  **kwargs
                  ) -> None:
 
@@ -3516,6 +3516,8 @@ def resume_optimization() -> None:
                                                                               traceback.format_exc(limit=6).strip()))
             # TODO Deal with this error, check what would happen if the directories weren't (re)moved, maybe use another
             #  way to move directories
+    # Set optimization class attributes
+    optimization.set_optimization_class_attributes(optimization_input=optimization.optimization_input)
     # Overwrite optimization options, if the file argument was given
     if args.file is not None:
         with open(_input_dir + "/" + args.file, "r") as opt_input_file:
