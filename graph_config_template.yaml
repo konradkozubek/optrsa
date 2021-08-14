@@ -14,4 +14,4 @@ inset_origin: [0.5, 0.4]
 inset_size: [0.4, 0.3]
 inset_x_ticks: 10
 inset_y_ticks: 6
-
+indicate_inset_zoom: false

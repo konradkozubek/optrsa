@@ -176,7 +176,7 @@ def logistic(x, min: Optional[float] = 0, max: Optional[float] = 1, k: Optional[
     :param x: Argument suitable to pass to NumPy functions using array_like arguments
     :param min: Optional parameter defining left asymptote of the function, defaults to 0
     :param max: Optional parameter defining right asymptote of the function, defaults to 1
-    :param k: Optional parameter determining "sharpness" of the function, defaults to 1
+    :param k: Optional parameter determining "steepness" of the function, defaults to 1
     :return: Object of the same type as x, element-wise logistic function of x
     """
     return min + (max - min) / (1 + np.exp(-k * x))
@@ -2036,13 +2036,6 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # particle_drawings_annotations(part_attrs_col="worstpartattrs", packing_frac_col="worstpfrac", color="b",
         #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.15))
         # drawings_offset=(0.1, -0.1) (0.2, -0.3)
-        # particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
-        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., 0.1))
-        # # drawings_offset = (0.1, 0.1) (0.2, -0.1)
-        particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
-                                      modulo=modulo, drawings_scale=drawings_scale,
-                                      position="x", vertical_alignment=graph_config["best_position"])  # 0.3
-        # vertical_alignment=1.08
         # particle_drawings_annotations(part_attrs_col="medianpartattrs", packing_frac_col="medianpfrac", color="r",
         #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., -0.1))
         # # drawings_offset=(0.1, 0.) (0.2, -0.2)
@@ -2050,6 +2043,13 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                       modulo=modulo, drawings_scale=drawings_scale,
                                       position="x", vertical_alignment=graph_config["median_position"])  # 0.2
         # vertical_alignment=0.22
+        # particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
+        #                               modulo=modulo, drawings_scale=drawings_scale, drawings_offset=(0., 0.1))
+        # # drawings_offset = (0.1, 0.1) (0.2, -0.1)
+        particle_drawings_annotations(part_attrs_col="bestpartattrs", packing_frac_col="bestpfrac", color="g",
+                                      modulo=modulo, drawings_scale=drawings_scale,
+                                      position="x", vertical_alignment=graph_config["best_position"])  # 0.3
+        # vertical_alignment=1.08
         particle_drawings_annotations(part_attrs_col="meanpartattrs",
                                       modulo=modulo, drawings_scale=drawings_scale,
                                       position="x", vertical_alignment=graph_config["mean_position"], means=True)
@@ -2074,7 +2074,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         inset_ax = ax.inset_axes(graph_config["inset_origin"] + graph_config["inset_size"])
         inset_ax.set_xlim([graph_config["inset_data_x"][0] - 0.5, graph_config["inset_data_x"][1] + 0.5])
         inset_ax.set_ylim(graph_config["inset_data_y"])
-        ax.indicate_inset_zoom(inset_ax, edgecolor="black")
+        if graph_config["indicate_inset_zoom"]:
+            ax.indicate_inset_zoom(inset_ax, edgecolor="k")
         inset_ax.tick_params(direction="in", right=True, top=True)
         inset_optimization_data = optimization_data[graph_config["inset_data_x"][0]:graph_config["inset_data_x"][1] + 1]
         inset_candidates_data = [np.array(gen_cands_data.split(","), dtype=np.float).reshape(-1, 3)
@@ -2971,6 +2972,7 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     min_radial_coordinate_optclattr: float = None
     max_radial_coordinate_optclattr: float = None
+    rad_coord_trans_steepness_optclattr: float = None
 
     def get_arg_signature(self) -> str:
         return "vertices-" + str(self.initial_mean.size - 1) + "-initstds-" + str(self.initial_stddevs) \
@@ -2983,7 +2985,10 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     @classmethod
     def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
-        radial_coordinates = logistic(arg, cls.min_radial_coordinate_optclattr, cls.max_radial_coordinate_optclattr)
+        radial_coordinates = logistic(arg,
+                                      cls.min_radial_coordinate_optclattr,
+                                      cls.max_radial_coordinate_optclattr,
+                                      cls.rad_coord_trans_steepness_optclattr)
         azimuthal_coordinates = np.linspace(start=0, stop=2 * np.pi, num=arg.size, endpoint=False)
         return "rt", np.stack((radial_coordinates, azimuthal_coordinates), axis=1)
 
@@ -3440,7 +3445,10 @@ def optimize() -> None:
         constr_variable_radii_polygon_opt.run()
 
     def opt_variable_radii_uniform_t_polygon() -> None:
-        polygon_initial_mean = np.zeros(optimization_input["opt_mode_args"]["vertices_num"])
+        if optimization_input["opt_mode_args"]["polygon_initial_mean"] == "regular_polygon":
+            polygon_initial_mean = np.full(shape=optimization_input["opt_mode_args"]["vertices_num"],
+                                           fill_value=optimization_input["opt_mode_args"]["initial_mean_params"]
+                                               ["polygon_radius"])
         initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
         opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
         opt_class_args["initial_mean"] = initial_mean
