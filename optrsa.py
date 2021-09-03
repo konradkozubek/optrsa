@@ -287,6 +287,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                        "meanarg": str,
                                        "meanpartattrs": str,
                                        "stddevs": str,
+                                       "covmat": str,
                                        "partstddevs": str,
                                        "bestind": np.int, "bestarg": str, "bestpartattrs": str,
                                        "bestpfrac": np.float, "bestpfracstddev": np.float,
@@ -300,6 +301,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     #                                         field_names=["candidate_num", "simulation_num", "first_collector_num",
     #                                                      "collectors_num", "return_code", "node_message", "pid",
     #                                                      "start_time", "time", "particles_numbers"])
+
+    stddevs_sample_size_optclattr: int = 10 ** 6
 
     @abc.abstractmethod
     def get_arg_signature(self) -> str:
@@ -439,7 +442,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # TODO Maybe move these definitions to run method (then redirecting output will be done only in run method and
         #  CMAES initialization information will be added to output file).
         #  Then change here self.CMAES initialization to self.CMAES = None.
-        #  In run method, before self.CMAES assignement add printing optimization signature, and after optimization add
+        #  In run method, before self.CMAES assignment add printing optimization signature, and after optimization add
         #  printing current time (maybe also the optimization time).
         # Counter of conducted simulations
         self.simulations_num = 0
@@ -609,19 +612,32 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         return ""
 
     @classmethod
+    def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
+        """Function returning particle's parameters based on arg"""
+        return arg
+
+    @classmethod
     def arg_in_domain(cls, arg: np.ndarray) -> bool:
         """Function checking if arg belongs to the optimization domain"""
         return True
 
     @classmethod
     @abc.abstractmethod
-    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
         """
-        Function returning particle attributes' standard deviations based on standard deviations (and possibly mean
+        Function returning particle's parameters' standard deviations based on standard deviations (and possibly mean
         coordinates) in optimization's space
         """
         # TODO Check, how standard deviations should be transformed
-        pass
+        optimization_sample = np.random.default_rng().multivariate_normal(arg,
+                                                                          covariance_matrix,
+                                                                          cls.stddevs_sample_size_optclattr)
+        particle_parameters_sample = np.apply_along_axis(func1d=cls.arg_to_particle_parameters,
+                                                         axis=1,
+                                                         arr=optimization_sample)
+        particle_parameters_stddevs = np.std(particle_parameters_sample, axis=0, dtype=np.float64)
+        return particle_parameters_stddevs
 
     @classmethod
     @abc.abstractmethod
@@ -1698,7 +1714,12 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                            " ".join(map(str, self.CMAES.mean)),
                            self.arg_to_particle_attributes(self.CMAES.mean),  # " ".join(map(str, self.CMAES.mean))
                            " ".join(map(str, self.stddevs)),
-                           " ".join(map(str, self.stddevs_to_particle_stddevs(self.CMAES.mean, self.stddevs))),
+                           # TODO Address the issue with save_optimization_data method, which does not have information
+                           #  about covariance matrices during optimization
+                           ";".join([",".join(map(str, row)) for row in self.covariance_matrix]),
+                           " ".join(map(str, self.stddevs_to_particle_stddevs(self.CMAES.mean,
+                                                                              self.stddevs,
+                                                                              self.covariance_matrix))),
                            str(best_cand.name), best_cand.at["arg"], best_cand.at["partattrs"],
                            str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
                            str(median_cand.name), median_cand.at["arg"], median_cand.at["partattrs"],
@@ -1749,7 +1770,11 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                    " ".join(map(str, mean_arg)),
                                    cls.arg_to_particle_attributes(mean_arg),
                                    " ".join(map(str, stddevs)),
-                                   " ".join(map(str, cls.stddevs_to_particle_stddevs(mean_arg, stddevs))),
+                                   # TODO Address the problem that this method does not have information about
+                                   #  covariance matrices during optimization
+                                   " ".join(map(str, cls.stddevs_to_particle_stddevs(mean_arg,
+                                                                                     stddevs,
+                                                                                     np.diag(stddevs ** 2)))),
                                    str(best_cand.name), best_cand.at["arg"], best_cand.at["partattrs"],
                                    str(best_cand.at["pfrac"]), str(best_cand.at["pfracstddev"]),
                                    str(median_cand.name), median_cand.at["arg"], median_cand.at["partattrs"],
