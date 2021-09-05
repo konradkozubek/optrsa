@@ -302,7 +302,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     #                                                      "collectors_num", "return_code", "node_message", "pid",
     #                                                      "start_time", "time", "particles_numbers"])
 
-    stddevs_sample_size_optclattr: int = 10 ** 6
+    stddevs_sample_size_optclattr: int = None
 
     @abc.abstractmethod
     def get_arg_signature(self) -> str:
@@ -630,9 +630,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         coordinates) in optimization's space
         """
         # TODO Check, how standard deviations should be transformed
-        optimization_sample = np.random.default_rng().multivariate_normal(arg,
-                                                                          covariance_matrix,
-                                                                          cls.stddevs_sample_size_optclattr)
+        optimization_sample = np.random.default_rng().multivariate_normal(mean=arg,
+                                                                          cov=covariance_matrix,
+                                                                          size=cls.stddevs_sample_size_optclattr)
         particle_parameters_sample = np.apply_along_axis(func1d=cls.arg_to_particle_parameters,
                                                          axis=1,
                                                          arr=optimization_sample)
@@ -643,7 +643,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
                       arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
-                      part_std_devs: Optional[np.ndarray] = None)\
+                      covariance_matrix: Optional[np.ndarray] = None, part_std_devs: Optional[np.ndarray] = None) \
             -> matplotlib.offsetbox.DrawingArea:
         """
         Abstract class method drawing particle described by `particle_attributes` string attribute on
@@ -656,6 +656,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                     information
         :param std_devs: Standard deviations of the probability distribution - may be given if it is needed to draw the
                          particle corresponding to the mean of the probability distribution
+        :param covariance_matrix: Covariance matrix of the probability distribution - may be given if it is needed to
+                                  draw the particle corresponding to the mean of the probability distribution
         :param part_std_devs: Particle attributes' standard deviations - they may be given in order to show them on the
                               drawing of the particle corresponding to the mean of the probability distribution
         :return: matplotlib.offsetbox.DrawingArea object with drawn particle
@@ -1977,11 +1979,15 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 else:
                     stddevs = np.array(optimization_data["stddevs"].at[gen_num].split(" "), dtype=np.float)
                     part_stddevs = np.array(optimization_data["partstddevs"].at[gen_num].split(" "), dtype=np.float)
+                    covariance_matrix = np.array([row.split(",") for row in
+                                                  optimization_data["covmat"].at[gen_num].split(";")], dtype=np.float)
+                    # covariance_matrix = np.diag(stddevs ** 2)
                     drawing_area = cls.draw_particle(particle_attributes=part_attrs,
                                                      scaling_factor=scaling_factor,
                                                      color=color,
                                                      arg=arg,
                                                      std_devs=stddevs,
+                                                     covariance_matrix=covariance_matrix,
                                                      part_std_devs=part_stddevs)
                     arrows = False
                 if arrows:
@@ -2508,7 +2514,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
                       arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
-                      part_std_devs: Optional[np.ndarray] = None)\
+                      covariance_matrix: Optional[np.ndarray] = None, part_std_devs: Optional[np.ndarray] = None) \
             -> matplotlib.offsetbox.DrawingArea:
         # Extract particle data
         # Scale polydisks so that they have unitary area
@@ -2677,17 +2683,27 @@ class FixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
     # TODO Check, if constructor has to be overwritten
 
     @classmethod
+    def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
+        """
+        Function returning polydisk's parameters in a numpy ndarray with c01 c02 r0 c11 c12 r1 ... floats (disks'
+        coordinates and radii)
+        """
+        arg_with_radii = np.insert(arg, np.arange(2, arg.size + 1, 2), 1.)
+        return arg_with_radii
+
+    @classmethod
     def arg_to_polydisk_attributes(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
         """
         Function returning part of Polydisk's particleAttributes in a tuple, which first element is \"xy\" or \"rt\"
         string indicating type of coordinates and the second is a numpy ndarray with c01 c02 r0 c11 c12 r1 ... floats
         (disks' coordinates and radii)
         """
-        arg_with_radii = np.insert(arg, np.arange(2, arg.size + 1, 2), 1.)
+        arg_with_radii = cls.arg_to_particle_parameters(arg)
         return "xy", arg_with_radii
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
         stddevs_with_radii = np.insert(stddevs, np.arange(2, stddevs.size + 1, 2), 0.)
         return stddevs_with_radii
 
@@ -2714,18 +2730,28 @@ class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
     # TODO Check, if constructor has to be overwritten
 
     @classmethod
+    def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
+        """
+        Function returning polydisk's parameters in a numpy ndarray with c01 c02 r0 c11 c12 r1 ... floats (disks'
+        coordinates and radii)
+        """
+        arg_with_standard_disks_radii = np.insert(arg, np.arange(2, arg.size, 2), 1.)
+        arg_with_all_disks = np.concatenate((arg_with_standard_disks_radii, np.array([0., 1., 0., 0., 1.])))
+        return arg_with_all_disks
+
+    @classmethod
     def arg_to_polydisk_attributes(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
         """
         Function returning part of Polydisk's particleAttributes in a tuple, which first element is \"xy\" or \"rt\"
         string indicating type of coordinates and the second is a numpy ndarray with c01 c02 r0 c11 c12 r1 ... floats
         (disks' coordinates and radii)
         """
-        arg_with_standard_disks_radii = np.insert(arg, np.arange(2, arg.size, 2), 1.)
-        arg_with_all_disks = np.concatenate((arg_with_standard_disks_radii, np.array([0., 1., 0., 0., 1.])))
+        arg_with_all_disks = cls.arg_to_particle_parameters(arg)
         return "xy", arg_with_all_disks
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
         stddevs_with_standard_disks_radii = np.insert(stddevs, np.arange(2, stddevs.size, 2), 0.)
         stddevs_with_all_disks = np.concatenate((stddevs_with_standard_disks_radii, np.zeros(5, dtype=np.float)))
         return stddevs_with_all_disks
@@ -2735,10 +2761,12 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 
     mode_rsa_parameters: dict = dict(RSACMAESOptimization.mode_rsa_parameters,
                                      surfaceDimension="2", particleType="Polygon")
+    # string indicating type of coordinates, e.g. "xy" or "rt"
+    coordinates_type: str = None
 
     @classmethod
     @abc.abstractmethod
-    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
+    def select_vertices(cls, points: np.ndarray) -> np.ndarray:
         """
         Function selecting polygon's vertices from points returned by the arg_to_points_coordinates method. Given
         a NumPy ndarray of shape (n, 2) with points' coordinates, it returns indices of the subsequent polygon's
@@ -2748,45 +2776,56 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 
     @classmethod
     @abc.abstractmethod
-    def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+    def arg_to_points_coordinates(cls, arg: np.ndarray) -> np.ndarray:
         """
-        Function returning coordinates of points being candidates for becoming polygon's vertices. First element of the
-        returned tuple is \"xy\" or \"rt\" string indicating type of coordinates and the second is a NumPy ndarray of
-        shape (n, 2) with floats representing points' coordinates
+        Function returning coordinates of points being candidates for becoming polygon's vertices in a NumPy ndarray of
+        shape (n, 2) with floats
         """
         pass
 
     @classmethod
+    def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
+        """
+        Function returning points' (not polygon's) parameters based on arg
+        """
+        points_parameters = cls.arg_to_points_coordinates(arg).flatten()
+        return points_parameters
+
+    @classmethod
     def arg_to_particle_attributes(cls, arg: np.ndarray) -> str:
         """Function returning rsa3d program's parameter particleAttributes based on arg"""
-        coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
-        vertices = points_coordinates[cls.select_vertices(coordinates_type, points_coordinates)].flatten()
+        points_parameters = cls.arg_to_particle_parameters(arg)
+        points_coordinates = points_parameters.reshape(-1, 2)
+        vertices = points_coordinates[cls.select_vertices(points_coordinates)].flatten()
         vertices_num = vertices.size // 2
-        particle_attributes_list = [str(vertices_num), coordinates_type]
+        particle_attributes_list = [str(vertices_num), cls.coordinates_type]
         particle_attributes_list.extend(vertices.astype(np.unicode).tolist())
         particle_attributes_list.append(str(vertices_num))
         particle_attributes_list.extend(np.arange(vertices_num).astype(np.unicode).tolist())
         return " ".join(particle_attributes_list)
 
     @classmethod
-    @abc.abstractmethod
-    def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_points_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
         """
         Function returning standard deviations of points being candidates for becoming polygon's vertices in a form of
-        a NumPy ndarray of shape (n, 2) with floats representing points' standard deviations
+        a NumPy ndarray of shape (n, 2) with floats representing points' standard deviations. By default it calculates
+        points' standard deviations by sampling.
         """
-        pass
+        return super().stddevs_to_particle_stddevs(arg, stddevs, covariance_matrix).reshape(-1, 2)
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
-        points_stddevs = cls.stddevs_to_points_stddevs(stddevs)
-        coordinates_type, points_coordinates = cls.arg_to_points_coordinates(arg)
-        return points_stddevs[cls.select_vertices(coordinates_type, points_coordinates)].flatten()
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
+        points_stddevs = cls.stddevs_to_points_stddevs(arg, stddevs, covariance_matrix)
+        points_coordinates = cls.arg_to_points_coordinates(arg)
+        return points_stddevs[cls.select_vertices(points_coordinates)].flatten()
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
                       arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
-                      part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
+                      covariance_matrix: Optional[np.ndarray] = None, part_std_devs: Optional[np.ndarray] = None) \
+            -> matplotlib.offsetbox.DrawingArea:
         # TODO Implement it
         pass
 
@@ -2794,18 +2833,18 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
 class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     @classmethod
-    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
-        if coordinates_type != "xy":
+    def select_vertices(cls, points: np.ndarray) -> np.ndarray:
+        if cls.coordinates_type != "xy":
             # ConvexHull constructor requires Cartesian coordinates, so a conversion has to be made
             conversions = {
                 "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
             }
-            if coordinates_type in conversions:
+            if cls.coordinates_type in conversions:
                 # TODO Test this conversion
-                points = np.apply_along_axis(func1d=conversions[coordinates_type], axis=1, arr=points)
+                points = np.apply_along_axis(func1d=conversions[cls.coordinates_type], axis=1, arr=points)
             else:
                 raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
-                                          "yet.".format(coordinates_type))
+                                          "yet.".format(cls.coordinates_type))
         if np.all(points == points[0, :]):
             # Degenerate case of initializing mean of the distribution with a sequence of equal points
             # TODO Check, if this is the right thing to do
@@ -2818,9 +2857,9 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 class StarShapedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
 
     @classmethod
-    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
+    def select_vertices(cls, points: np.ndarray) -> np.ndarray:
         points = np.copy(points)  # NumPy arrays are passed by reference, so this prevents modifying passed object
-        if coordinates_type != "xy":
+        if cls.coordinates_type != "xy":
             # Polygonization algorithm converts coordinates to radial with respect to the mean (center of weight) of the
             # points. A conversion is made to make calculations simple. In case of the radial coordinates ("rt"), the
             # center point may be used as the reference, but then it might happen that it is placed outside the convex
@@ -2830,12 +2869,12 @@ class StarShapedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
             conversions = {
                 "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
             }
-            if coordinates_type in conversions:
+            if cls.coordinates_type in conversions:
                 # TODO Test this conversion
-                points = np.apply_along_axis(func1d=conversions[coordinates_type], axis=1, arr=points)
+                points = np.apply_along_axis(func1d=conversions[cls.coordinates_type], axis=1, arr=points)
             else:
                 raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
-                                          "yet.".format(coordinates_type))
+                                          "yet.".format(cls.coordinates_type))
         if np.all(points == points[0, :]):
             # Degenerate case of initializing mean of the distribution with a sequence of equal points
             # TODO Check, if this is the right thing to do
@@ -2969,18 +3008,20 @@ class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                      "collectors": "5",
                                      "split": "100000",
                                      "boundaryConditions": "periodic"})
+    coordinates_type: str = "xy"
 
     def get_arg_signature(self) -> str:
         vertices_num = (self.initial_mean.size - 1) // 2 + 2
         return "vertices-" + str(vertices_num) + "-initstds-" + str(self.initial_stddevs)
 
     @classmethod
-    def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+    def arg_to_points_coordinates(cls, arg: np.ndarray) -> np.ndarray:
         arg_with_all_coordinates = np.concatenate((arg, np.zeros(3))).reshape(-1, 2)
-        return "xy", arg_with_all_coordinates
+        return arg_with_all_coordinates
 
     @classmethod
-    def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_points_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
         stddevs_with_all_coordinates = np.concatenate((stddevs, np.zeros(3))).reshape(-1, 2)
         return stddevs_with_all_coordinates
 
@@ -2998,6 +3039,7 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
     min_radial_coordinate_optclattr: float = None
     max_radial_coordinate_optclattr: float = None
     rad_coord_trans_steepness_optclattr: float = None
+    coordinates_type: str = "rt"
 
     def get_arg_signature(self) -> str:
         return "vertices-" + str(self.initial_mean.size - 1) + "-initstds-" + str(self.initial_stddevs) \
@@ -3005,23 +3047,17 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                + "-outr-" + str(self.max_radial_coordinate_optclattr)
 
     @classmethod
-    def select_vertices(cls, coordinates_type: str, points: np.ndarray) -> np.ndarray:
+    def select_vertices(cls, points: np.ndarray) -> np.ndarray:
         return np.arange(points.shape[0])
 
     @classmethod
-    def arg_to_points_coordinates(cls, arg: np.ndarray) -> Tuple[str, np.ndarray]:
+    def arg_to_points_coordinates(cls, arg: np.ndarray) -> np.ndarray:
         radial_coordinates = logistic(arg,
                                       cls.min_radial_coordinate_optclattr,
                                       cls.max_radial_coordinate_optclattr,
                                       cls.rad_coord_trans_steepness_optclattr)
         azimuthal_coordinates = np.linspace(start=0, stop=2 * np.pi, num=arg.size, endpoint=False)
-        return "rt", np.stack((radial_coordinates, azimuthal_coordinates), axis=1)
-
-    @classmethod
-    def stddevs_to_points_stddevs(cls, stddevs: np.ndarray) -> np.ndarray:
-        # TODO Correct this transformation
-        points_stddevs = logistic(stddevs, cls.min_radial_coordinate_optclattr, cls.max_radial_coordinate_optclattr)
-        return np.stack((points_stddevs, np.zeros_like(stddevs)), axis=1)
+        return np.stack((radial_coordinates, azimuthal_coordinates), axis=1)
 
 
 class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -3073,7 +3109,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
             else:
                 raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
                                           "yet.".format(coordinates_type))
-        if ConvexPolygonRSACMAESOpt.select_vertices(coordinates_type="xy", points=part_data).size == vertices_num:
+        if ConvexHull(part_data).vertices.size == vertices_num:
             # If the polygon is convex, then don't pass its area
             return str(radius) + " " + polygon_particle_attributes
         else:
@@ -3087,16 +3123,21 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
             return " ".join([str(radius), polygon_particle_attributes, str(area)])
 
     @classmethod
-    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray) -> np.ndarray:
+    def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
+            -> np.ndarray:
         radius_stddev, polygon_stddevs = cls.stddevs_to_radius_and_polygon_stddevs(stddevs)
         polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)[1]
-        polygon_particle_stddevs = super().stddevs_to_particle_stddevs(polygon_arg, polygon_stddevs)
+        polygon_covariance_matrix = covariance_matrix[1:, 1:]  # TODO Maybe create a method for that
+        polygon_particle_stddevs = super().stddevs_to_particle_stddevs(polygon_arg,
+                                                                       polygon_stddevs,
+                                                                       polygon_covariance_matrix)
         return np.insert(polygon_particle_stddevs, 0, radius_stddev)
 
     @classmethod
     def draw_particle(cls, particle_attributes: str, scaling_factor: float, color: str,
                       arg: Optional[np.ndarray] = None, std_devs: Optional[np.ndarray] = None,
-                      part_std_devs: Optional[np.ndarray] = None) -> matplotlib.offsetbox.DrawingArea:
+                      covariance_matrix: Optional[np.ndarray] = None, part_std_devs: Optional[np.ndarray] = None) \
+            -> matplotlib.offsetbox.DrawingArea:
         # Extract particle data
         particle_attributes_list = particle_attributes.split(" ")
         radius = float(particle_attributes_list[0])
@@ -3125,8 +3166,12 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                                                 scaling_factor * -(disk_center[0] - radius),
                                                                 scaling_factor * -(disk_center[1] - radius))
             else:
+                polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)[1]
                 radius_std_dev, polygon_std_devs = cls.stddevs_to_radius_and_polygon_stddevs(std_devs)
-                points_std_devs = cls.stddevs_to_points_stddevs(polygon_std_devs)
+                polygon_covariance_matrix = covariance_matrix[1:, 1:]  # TODO Maybe create a method for that
+                points_std_devs = cls.stddevs_to_points_stddevs(polygon_arg,
+                                                                polygon_std_devs,
+                                                                polygon_covariance_matrix)
                 # TODO t coordinate's (angle's) standard deviation should not be scaled
                 points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
                 radius_std_dev /= sqrt_area
@@ -3179,9 +3224,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                             drawing_area.add_artist(std_dev_arrow)
             return drawing_area
         # Calculate particle area
-        if issubclass(cls, ConvexPolygonRSACMAESOpt) \
-                or ConvexPolygonRSACMAESOpt.select_vertices(coordinates_type="xy", points=part_data).size \
-                == vertices_num:
+        if issubclass(cls, ConvexPolygonRSACMAESOpt) or ConvexHull(part_data).vertices.size == vertices_num:
             # Method of calculation valid for convex polygons
             # TODO Maybe add a method calculating particle's area
             center_of_mass = np.mean(part_data, axis=0)
@@ -3207,7 +3250,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
         radius /= sqrt_area
         if arg is not None:
             polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)[1]
-            coordinates_type, points_coordinates = cls.arg_to_points_coordinates(polygon_arg)
+            points_coordinates = cls.arg_to_points_coordinates(polygon_arg)
             # coordinates_type is overwritten, although it should be the same
             if coordinates_type != "xy":
                 conversions = {
@@ -3223,8 +3266,10 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                               "implemented yet.".format(coordinates_type))
             points_data = points_coordinates.reshape(-1, 2) / sqrt_area
         if part_std_devs is not None:
+            polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)[1]
             radius_std_dev, polygon_std_devs = cls.stddevs_to_radius_and_polygon_stddevs(std_devs)
-            points_std_devs = cls.stddevs_to_points_stddevs(polygon_std_devs)
+            polygon_covariance_matrix = covariance_matrix[1:, 1:]  # TODO Maybe create a method for that
+            points_std_devs = cls.stddevs_to_points_stddevs(polygon_arg, polygon_std_devs, polygon_covariance_matrix)
             points_std_devs_data = points_std_devs.reshape(-1, 2) / sqrt_area
             # std_devs_data = part_std_devs.reshape(-1, 2) / sqrt_area
             radius_std_dev /= sqrt_area
