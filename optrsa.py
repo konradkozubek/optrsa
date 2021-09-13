@@ -2896,7 +2896,7 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
         center = np.mean(vertices, axis=0)
         inner_points_indices = np.setdiff1d(np.arange(points_num), vertices_indices, assume_unique=True)
 
-        transformed_inner_points_xy = np.empty(0, dtype=np.float)
+        transformed_inner_points_xy = np.empty((0, 2), dtype=np.float)
         for inner_point_index in inner_points_indices:
             inner_point = points_xy[inner_point_index]
             inner_point_vector = inner_point - center
@@ -2913,7 +2913,7 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                     - side_slope * vertices[i, 0] + vertices[i, 1]) / (transf_line_slope - side_slope)
             transf_inner_point_y = transf_line_slope * (transf_inner_point_x - center[0]) + center[1]
             transformed_inner_point_xy = np.array([transf_inner_point_x, transf_inner_point_y])
-            transformed_inner_points_xy = np.append(transformed_inner_points_xy, transformed_inner_point_xy)
+            transformed_inner_points_xy = np.vstack((transformed_inner_points_xy, transformed_inner_point_xy))
 
         if cls.coordinates_type != "xy":
             conversions = {
@@ -3515,7 +3515,13 @@ class VariableRadiiRoundedPolygonRSACMAESOpt(RoundedPolygonRSACMAESOpt, metaclas
 
 class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
                                                         ConstrXYConvexPolygonRSACMAESOpt):
-    pass
+
+    @classmethod
+    def swap_arg(cls, arg: np.ndarray) -> np.ndarray:
+        radius, polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)
+        swapped_polygon_arg = super().swap_arg(polygon_arg)
+        swapped_arg = np.insert(swapped_polygon_arg, 0, radius)
+        return swapped_arg
 
 
 class ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
@@ -3525,7 +3531,13 @@ class ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(FixedRadiiRoundedPol
 
 class ConstrXYVariableRadiiRoundedConvexPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
                                                            ConstrXYConvexPolygonRSACMAESOpt):
-    pass
+
+    @classmethod
+    def swap_arg(cls, arg: np.ndarray) -> np.ndarray:
+        radius, polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)
+        swapped_polygon_arg = super().swap_arg(polygon_arg)
+        swapped_arg = np.insert(swapped_polygon_arg, 0, radius)
+        return swapped_arg
 
 
 class ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
