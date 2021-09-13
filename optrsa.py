@@ -622,6 +622,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         return True
 
     @classmethod
+    def swap_arg(cls, arg: np.ndarray) -> np.ndarray:
+        """
+        Function swapping arg to another, for which the objective function value is the same. In some cases it may be
+        useful to do it in order to manage plateaus. By default, it does not change the argument.
+        """
+        return arg
+
+    @classmethod
     @abc.abstractmethod
     def stddevs_to_particle_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
             -> np.ndarray:
@@ -2083,7 +2091,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # vertical_alignment=1.08
         particle_drawings_annotations(part_attrs_col="meanpartattrs",
                                       modulo=modulo, drawings_scale=drawings_scale,
-                                      position="x", vertical_alignment=graph_config["mean_position"], means=True)
+                                      position="x", vertical_alignment=graph_config["mean_position"],
+                                      means=graph_config["annotate_mean_particles"])
         # 0.9  # 0.95
         # vertical_alignment=0.1
         gen_nums = list(range(0, data_len, modulo))
@@ -2132,6 +2141,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         inset_ax.locator_params(axis="y", nbins=graph_config["inset_y_ticks"])
         inset_ax.grid()
 
+        plt.tight_layout()
         plt.show()
 
     @waiting_for_graphs
@@ -2187,9 +2197,13 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.covariance_matrix = self.CMAES.sigma ** 2 * self.CMAES.sm.covariance_matrix
             for line in pprint.pformat(self.covariance_matrix).split("\n"):  # or .splitlines()
                 self.logger.info(msg=line)
-            self.logger.debug(msg="Phenotype candidates:")
+            self.logger.info(msg="Phenotype candidates:")
             for line in pprint.pformat(pheno_candidates).split("\n"):
-                self.logger.debug(msg=line)
+                self.logger.info(msg=line)
+            swapped_pheno_candidates = [self.swap_arg(arg) for arg in pheno_candidates]
+            self.logger.info(msg="Swapped phenotype candidates:")
+            for line in pprint.pformat(swapped_pheno_candidates).split("\n"):
+                self.logger.info(msg=line)
             # values = self.evaluate_generation_parallel(pheno_candidates) if self.parallel\
             #     else self.evaluate_generation_serial(pheno_candidates)
             # TODO Maybe make evaluate_generation_* methods return values as np.ndarray
@@ -2421,7 +2435,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                 # self.arg_to_particle_attributes would be called. All data read from file by self.log_generation_data
                 # would be available. Standard deviations could be written to optimization-output.log file, too.
                 self.log_generation_data()
-            self.CMAES.tell(pheno_candidates, values)
+            self.CMAES.tell(swapped_pheno_candidates, values)
             self.CMAES.logger.add()
             # Pickling of the object
             # TODO Add jsonpickle pickling
@@ -2784,6 +2798,14 @@ class PolygonRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         pass
 
     @classmethod
+    @abc.abstractmethod
+    def points_coordinates_to_arg(cls, points: np.ndarray) -> np.ndarray:
+        """
+        Inverse of the arg_to_points_coordinates function
+        """
+        pass
+
+    @classmethod
     def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
         """
         Function returning points' (not polygon's) parameters based on arg
@@ -2852,6 +2874,67 @@ class ConvexPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
         # TODO Maybe deal with other degenerate cases
         convex_hull = ConvexHull(points)
         return convex_hull.vertices
+
+    @classmethod
+    def swap_arg(cls, arg: np.ndarray) -> np.ndarray:
+        points = cls.arg_to_points_coordinates(arg)
+        if cls.coordinates_type != "xy":
+            conversions = {
+                "rt": lambda point: np.array([point[0] * np.cos(point[1]), point[0] * np.sin(point[1])])
+            }
+            if cls.coordinates_type in conversions:
+                points_xy = np.apply_along_axis(func1d=conversions[cls.coordinates_type], axis=1, arr=points)
+            else:
+                raise NotImplementedError("Conversion of {} coordinates into Cartesian coordinates is not implemented"
+                                          "yet.".format(cls.coordinates_type))
+        else:
+            points_xy = points
+        points_num = points_xy.shape[0]
+        vertices_indices = cls.select_vertices(points_xy)
+        vertices_num = vertices_indices.size
+        vertices = points_xy[vertices_indices]
+        center = np.mean(vertices, axis=0)
+        inner_points_indices = np.setdiff1d(np.arange(points_num), vertices_indices, assume_unique=True)
+
+        transformed_inner_points_xy = np.empty(0, dtype=np.float)
+        for inner_point_index in inner_points_indices:
+            inner_point = points_xy[inner_point_index]
+            inner_point_vector = inner_point - center
+            i = 0
+            while i < vertices_num - 1:
+                if np.cross(vertices[i] - center, inner_point_vector) \
+                        * np.cross(vertices[i + 1] - center, inner_point_vector) < 0:
+                    break
+                i += 1
+            # TODO Handle case in which vertices[i + 1, 0] == vertices[i, 0]
+            side_slope = (vertices[i + 1, 1] - vertices[i, 1]) / (vertices[i + 1, 0] - vertices[i, 0])
+            transf_line_slope = inner_point_vector[1] / inner_point_vector[0]
+            transf_inner_point_x = (transf_line_slope * center[0] - center[1]
+                                    - side_slope * vertices[i, 0] + vertices[i, 1]) / (transf_line_slope - side_slope)
+            transf_inner_point_y = transf_line_slope * (transf_inner_point_x - center[0]) + center[1]
+            transformed_inner_point_xy = np.array([transf_inner_point_x, transf_inner_point_y])
+            transformed_inner_points_xy = np.append(transformed_inner_points_xy, transformed_inner_point_xy)
+
+        if cls.coordinates_type != "xy":
+            conversions = {
+                "rt": lambda point: np.array([np.sqrt(point[0] ** 2 + point[1] ** 2),
+                                              np.arctan(point[1] / point[0]) if point[0] != 0
+                                              else np.pi / 2 if point[1] > 0
+                                              else 3 * np.pi / 2 if point[1] < 0 else 0])
+            }
+            if cls.coordinates_type in conversions:
+                transformed_inner_points = np.apply_along_axis(func1d=conversions[cls.coordinates_type],
+                                                               axis=1,
+                                                               arr=transformed_inner_points_xy)
+            else:
+                raise NotImplementedError("Conversion of Cartesian coordinates into {} coordinates is not implemented"
+                                          "yet.".format(cls.coordinates_type))
+        else:
+            transformed_inner_points = transformed_inner_points_xy
+
+        points[inner_points_indices] = transformed_inner_points
+        swapped_arg = cls.points_coordinates_to_arg(points)
+        return swapped_arg
 
 
 class StarShapedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
@@ -3020,6 +3103,10 @@ class ConstrXYPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
         return arg_with_all_coordinates
 
     @classmethod
+    def points_coordinates_to_arg(cls, points: np.ndarray) -> np.ndarray:
+        return points.flatten()[:-3]
+
+    @classmethod
     def stddevs_to_points_stddevs(cls, arg: np.ndarray, stddevs: np.ndarray, covariance_matrix: np.ndarray) \
             -> np.ndarray:
         stddevs_with_all_coordinates = np.concatenate((stddevs, np.zeros(3))).reshape(-1, 2)
@@ -3058,6 +3145,11 @@ class UniformTPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                                       cls.rad_coord_trans_steepness_optclattr)
         azimuthal_coordinates = np.linspace(start=0, stop=2 * np.pi, num=arg.size, endpoint=False)
         return np.stack((radial_coordinates, azimuthal_coordinates), axis=1)
+
+    @classmethod
+    def points_coordinates_to_arg(cls, points: np.ndarray) -> np.ndarray:
+        # TODO Implement it
+        pass
 
 
 class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
