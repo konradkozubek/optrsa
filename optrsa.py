@@ -3564,6 +3564,28 @@ def optimize() -> None:
         constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(**opt_class_args)
         constr_fixed_radii_polygon_opt.run()
 
+    def opt_constr_variable_radii_convex_polygon() -> None:
+        if optimization_input["opt_mode_args"]["polygon_initial_mean"] == "origin":
+            polygon_initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
+        elif optimization_input["opt_mode_args"]["polygon_initial_mean"] == "regular_polygon":
+            vertices_num = optimization_input["opt_mode_args"]["vertices_num"]
+            polygon_radius = optimization_input["opt_mode_args"]["initial_mean_params"]["polygon_radius"]
+            angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
+            vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([polygon_radius * np.cos(angle),
+                                                                                   polygon_radius * np.sin(angle)]),
+                                                    axis=0,
+                                                    arr=angles).T
+            shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
+            vertices = vertices_centered + np.array([polygon_radius * np.cos(shift_angle),
+                                                     polygon_radius * np.sin(shift_angle)])
+            polygon_initial_mean = vertices.flatten()[:-3]
+        initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
+        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        constr_variable_radii_polygon_opt = ConstrXYVariableRadiiRoundedConvexPolygonRSACMAESOpt(**opt_class_args)
+        constr_variable_radii_polygon_opt.run()
+
     def opt_constr_fixed_radii_star_shaped_polygon() -> None:
         if optimization_input["opt_mode_args"]["initial_mean"] == "origin":
             initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
@@ -3615,8 +3637,8 @@ def optimize() -> None:
         opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
         opt_class_args["initial_mean"] = initial_mean
         opt_class_args["optimization_input"] = optimization_input
-        constr_fixed_radii_polygon_opt = VariableRadiiRoundedUniformTPolygonRSACMAESOpt(**opt_class_args)
-        constr_fixed_radii_polygon_opt.run()
+        variable_radii_polygon_opt = VariableRadiiRoundedUniformTPolygonRSACMAESOpt(**opt_class_args)
+        variable_radii_polygon_opt.run()
 
 
     opt_modes = {
@@ -3624,6 +3646,7 @@ def optimize() -> None:
         "optconstrfixedradii": opt_constr_fixed_radii,
         "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon,
         "optconstrfixedradiistarshapedpolygon": opt_constr_fixed_radii_star_shaped_polygon,
+        "optconstrvariableradiiconvexpolygon": opt_constr_variable_radii_convex_polygon,
         "optconstrvariableradiistarshapedpolygon": opt_constr_variable_radii_star_shaped_polygon,
         "optvariableradiiuniformtpolygon": opt_variable_radii_uniform_t_polygon,
     }
