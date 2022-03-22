@@ -36,7 +36,7 @@ import shapely.geometry
 import argparse
 import json
 import pandas as pd
-from typing import Callable, Tuple, Union, List, Optional
+from typing import Callable, Tuple, Union, List, Optional, Set
 from collections import namedtuple
 import abc
 import inspect
@@ -62,6 +62,7 @@ import datetime
 import pickle
 from wolframclient.evaluation import WolframLanguageSession
 from wolframclient.language import wl
+from itertools import combinations
 
 
 # Get absolute path to optrsa project directory
@@ -2656,6 +2657,208 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         #                 wl.Graphics([wl.Darker(wl.Green, 0.45), w_disks])))
         wl_session.terminate()
         return area
+
+    @staticmethod
+    def analytical_polydisk_area(disks_params: np.ndarray) -> float:
+        """Calculate the area of a connected polydisk analytically"""
+        # TODO Check, if it works for 1-disk, 2-disk and 3-disk
+        accuracy = 10 ** -10
+        disks_arg = np.reshape(disks_params, (-1, 3))
+        disks = pd.DataFrame(data={"origin": list(disks_arg[:, [0, 1]]), "radius": disks_arg[:, 2]})
+        disks_number = disks.shape[0]
+
+        # Get the set of disks intersection points and discard the disks entirely contained in other disks
+        intersection_points = pd.DataFrame(index=pd.MultiIndex(levels=[[], [], []],
+                                                               codes=[[], [], []],
+                                                               names=["first_disk", "second_disk", "point_num"],
+                                                               dtype=np.int),
+                                           columns=["point_x", "point_y"],
+                                           dtype=np.float)
+        inner_disks_indices = set()
+        for i in range(0, disks_number):
+            first_disk = disks.iloc[i]
+            for j in range(i + 1, disks_number):
+                second_disk = disks.iloc[j]
+                distance = np.linalg.norm(second_disk.at["origin"] - first_disk.at["origin"])
+                inclusion_distance = np.abs(first_disk.at["radius"] - second_disk.at["radius"])
+                disjointness_distance = first_disk.at["radius"] + second_disk.at["radius"]
+                # Check, if the disks intersect in two points or one disk is contained in the other
+                if inclusion_distance < distance < disjointness_distance:
+                    # The disks intersect in two points
+                    # Calculate intersection points
+                    # See https://math.stackexchange.com/questions/256100/how-can-i-find-the-points-at-which-two-circles
+                    # -intersect
+                    middle_radical_point = (first_disk.at["origin"] + second_disk.at["origin"]) / 2 \
+                                           + (np.power(first_disk.at["radius"], 2)
+                                              - np.power(second_disk.at["radius"], 2)) / (2 * np.power(distance, 2)) \
+                                           * (second_disk.at["origin"] - first_disk.at["origin"])
+                    radical_vector = np.sqrt(2 * (np.power(first_disk.at["radius"], 2)
+                                                  + np.power(second_disk.at["radius"], 2)) / np.power(distance, 2)
+                                             - np.power(np.power(first_disk.at["radius"], 2)
+                                                        - np.power(second_disk.at["radius"], 2), 2)
+                                             / np.power(distance, 4) - 1) / 2 \
+                                     * np.array([second_disk.at["origin"][1] - first_disk.at["origin"][1],
+                                                 first_disk.at["origin"][0] - second_disk.at["origin"][0]])
+                    intersection_points.loc[(i, j, 0)] = middle_radical_point + radical_vector
+                    intersection_points.loc[(i, j, 1)] = middle_radical_point - radical_vector
+                elif distance <= inclusion_distance:
+                    # One disk is contained in the other
+                    if first_disk.at["radius"] <= second_disk.at["radius"]:
+                        inner_disks_indices.add(i)
+                    else:
+                        inner_disks_indices.add(j)
+
+        # def polygon_area(points_indices: Tuple[int]) -> float:
+        #     pass
+
+        # def cap_area(...):
+        #     pass
+
+        def disks_intersection_area(disks_indices: Tuple[int]) -> float:
+            """Calculate the area of intersection of disks collection analytically"""
+            # Choose the "vertices" of the intersection region:
+            intersecting_disks_number = len(disks_indices)
+            if intersecting_disks_number == 1:
+                # Return the area of the disk:
+                radius = disks.iloc[disks_indices[0]].at["radius"]
+                return np.pi * radius * radius
+            intersection_points_indices = []
+            for i in range(0, intersecting_disks_number):
+                for j in range(i + 1, intersecting_disks_number):
+                    # Check, if the disks intersect in two points:
+                    if (disks_indices[i], disks_indices[j], 0) not in intersection_points.index:
+                        continue
+                    for k in [0, 1]:
+                        point_index = (disks_indices[i], disks_indices[j], k)
+                        # Check, if the point belongs to all of the intersecting disks:
+                        inner_point = True
+                        for disk_index in disks_indices:
+                            if np.linalg.norm(intersection_points.loc[point_index].values
+                                              - disks.iloc[disk_index].at["origin"]) \
+                                    > disks.iloc[disk_index].at["radius"] + accuracy:
+                                inner_point = False
+                                break
+                        # If it does, it is a "vertex" of the intersection region:
+                        if inner_point:
+                            intersection_points_indices.append(point_index)
+
+            # =============
+            print(disks_indices)
+            # =============
+            # Check, if disks are disjoint:
+            if len(intersection_points_indices) == 0:
+                # =============
+                print("Disjoint")
+                print()
+                # =============
+                return 0
+
+            # Calculate the area of the intersection region:
+            # TODO Check, what to do in the cases when the intersection is an intersection of two disks or a disk
+            # TODO Implement this for unconnected polydisks
+            # intersection_points.loc[intersection_points_indices] - pd.DataFrame with intersection points
+            # Find the order in which the intersection points form a convex polygon
+            vertices = intersection_points.loc[intersection_points_indices]
+            # =============
+            print(vertices)
+            # =============
+            center_point = vertices.mean()
+            vertices -= center_point
+            # =============
+            # if len(vertices) < 3:
+            #     return 0
+            # =============
+
+            def to_polar_coordinates(point: np.ndarray) -> np.ndarray:
+                x, y = point
+                r = np.sqrt(x * x + y * y)
+                if r == 0:
+                    t = 0
+                else:
+                    angle = np.arccos(x / r)
+                    if y >= 0:
+                        t = angle
+                    else:
+                        t = 2 * np.pi - angle
+                return np.array([r, t])
+
+            vertices_polar = np.apply_along_axis(func1d=to_polar_coordinates, axis=1, arr=vertices)
+            sorted_vertices_indices = np.argsort(vertices_polar[:, 1])
+            vertices_polar = vertices_polar[sorted_vertices_indices]
+            # I assume that there are at least 3 vertices
+            # Intersection region is a sum of a convex polygon and "caps"
+            area: float = 0
+            vertices_number = len(intersection_points_indices)
+            phase = 0
+            for i in range(vertices_number):
+                j = i + 1
+                if j == vertices_number:
+                    j = 0
+                    phase = 2 * np.pi
+                # Add area of the triangle
+                triangle_area = vertices_polar[i, 0] * vertices_polar[j, 0] \
+                                * np.sin(vertices_polar[j, 1] + phase - vertices_polar[i, 1]) / 2
+                area += triangle_area
+                # Find index of the disk to which the arc belongs to
+                first_int_point_index = intersection_points_indices[sorted_vertices_indices[i]]
+                second_int_point_index = intersection_points_indices[sorted_vertices_indices[j]]
+                if first_int_point_index[0] == second_int_point_index[0] \
+                        or first_int_point_index[0] == second_int_point_index[1]:
+                    if first_int_point_index[1] == second_int_point_index[1]:
+                        disk_index = first_int_point_index[first_int_point_index[2]]
+                        # (first_int_point_index[2] + 1) % 2
+                    else:
+                        disk_index = first_int_point_index[0]
+                else:
+                    disk_index = first_int_point_index[1]
+                # ============
+                print("Disk index: {}".format(disk_index))
+                # ============
+                # Calculate area of the "cap"
+                disk = disks.iloc[disk_index]
+                origin = disk.at["origin"]
+                radius = disk.at["radius"]
+                first_int_point = intersection_points.loc[first_int_point_index]
+                second_int_point = intersection_points.loc[second_int_point_index]
+                int_point_vectors_product = np.cross(first_int_point - origin, second_int_point - origin)
+                # ============
+                print("First point index: {}".format(first_int_point_index))
+                print("Second point index: {}".format(second_int_point_index))
+                print("Vector product: {}".format(int_point_vectors_product))
+                # ============
+                smaller_part_of_disk = int_point_vectors_product >= 0
+                if not smaller_part_of_disk:
+                    int_point_vectors_product = -int_point_vectors_product
+                # arc_area = np.arcsin(int_point_vectors_product / (radius * radius)) * radius * radius / 2
+                arc_area = np.arccos(np.dot(first_int_point - origin, second_int_point - origin) / (radius * radius)) \
+                           * radius * radius / 2
+                cap_triangle_area = int_point_vectors_product / 2
+                small_cap_area: float = arc_area - cap_triangle_area
+                cap_area: float = small_cap_area if smaller_part_of_disk else np.pi * radius * radius - small_cap_area
+                # Add area of the "cap"
+                area += cap_area
+                # ============
+                print("Triangle area: {}, arc area: {}, cap area: {}, partial intersection area: {}"
+                      .format(triangle_area, arc_area, cap_area, triangle_area + cap_area))
+                # ============
+            # ============
+            print("Intersection area: {}".format(area))
+            print()
+            # ============
+            return area
+
+        # Calculate the area of the polydisk using inclusion-exclusion principle
+        area: float = 0
+        all_disks_indices: Set[int] = set(range(disks_number))
+        disks_indices: Set[int] = all_disks_indices.difference(inner_disks_indices)
+        sign = 1
+        # See https://stackoverflow.com/questions/1482308/how-to-get-all-subsets-of-a-set-powerset ,
+        # https://docs.python.org/3/library/itertools.html#itertools-recipes
+        for n in range(1, len(disks_indices) + 1):
+            for disks_indices_subset in combinations(disks_indices, n):
+                area += sign * disks_intersection_area(disks_indices_subset)
+            sign *= -1
+        return area, intersection_points
 
     # @abc.abstractmethod
     # def get_arg_signature(self) -> str:
