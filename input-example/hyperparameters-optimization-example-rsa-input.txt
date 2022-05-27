@@ -1,0 +1,9 @@
+maxVoxels = 4000000                # upper bound on number of voxels
+requestedAngularVoxelSize = 0.3    # upper bound on voxel angular size (doesn't affect "initial voxels")
+minDx = 0.0                        # lower bound on voxel spatial size
+from = 0                           # first collector (packing) number <=> rnd seed
+split = 1000                       # number of failed RSA iterations to split voxels
+surfaceVolume = 400.0              # volume of a packing
+storePackings = true               # true if packings are to be saved to packing_[...].bin files
+boundaryConditions = periodic      # periodic or free
+seedOrigin = random

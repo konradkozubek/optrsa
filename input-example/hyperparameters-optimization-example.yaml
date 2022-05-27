@@ -1,0 +1,35 @@
+signature_suffix: &sig hyperparameters-optimization-example-1
+parameters:
+    opt_class: !param
+        type: choice
+        range: [Cfrsspg, Cvrsspg]
+    opt_mode_args:
+        vertices_num: 6
+        polygon_initial_mean: regular_polygon
+        initial_mean_params:
+            polygon_radius: !param
+                range: [1, 10]
+        rounding_initial_mean: !param
+            range: [1e-1, 1e1]
+            scale: log
+    opt_class_args:
+        initial_stddevs: !param
+            range: [0.5, 2]
+        stddevs_sample_size: 1e5
+        cma_options:
+            maxiter: 1
+            popsize: 3
+            CMA_mirrors: false
+            verb_disp: 1
+            verbose: 9
+        rsa_parameters:
+            surfaceVolume: 20
+            storePackings: true
+        accuracy: 5e-2
+        min_collectors_number: 3
+        parallel: true
+        input_rel_path: hyperparameters-optimization-example-rsa-input.txt
+        output_to_file: true
+        signature_suffix: *sig
+gpyopt_options:
+    max_num_trials: 6

@@ -1,4 +1,9 @@
-"""Main module in optrsa project"""
+"""
+Main module in optrsa project.
+
+Optimization of packing fraction of two-dimensional Random Sequential Adsorption (RSA)
+packings using Covariance Matrix Adaptation Evolution Strategy (CMA-ES).
+"""
 # TODO Read about docstrings and automatic documentation generation services like pydoctor
 
 import cma
@@ -33,8 +38,6 @@ import numpy as np
 from scipy.spatial import ConvexHull
 import shapely.geometry
 
-import argparse
-import json
 import pandas as pd
 from typing import Callable, Tuple, Union, List, Optional, Set
 from collections import namedtuple
@@ -48,7 +51,7 @@ from file_read_backwards import FileReadBackwards
 import traceback
 import logging
 import logging.config
-import yaml
+import ruamel.yaml
 import pprint
 import timeit
 # import subprocess
@@ -59,10 +62,13 @@ from concurrent.futures import Future
 import threading
 import time
 import datetime
+from copy import deepcopy
 import pickle
 from wolframclient.evaluation import WolframLanguageSession
 from wolframclient.language import wl
 from itertools import combinations
+from functools import wraps
+from module_arg_parser import ModuleArgumentParser
 
 
 # Get absolute path to optrsa project directory
@@ -80,11 +86,73 @@ _output_dir = _proj_dir + "/output"
 _outrsa_dir = _proj_dir + "/outrsa"  # To be removed
 _outcmaes_dir = _proj_dir + "/outcmaes"  # To be removed
 _cmaes_logging_config = _proj_dir + "/optimization_logging.yaml"
+libraries_info_logfile_excluded_loggers = ["optrsa"]
 graph_processes = []
+opt_classes = {}
 
 
+# class ChosenLoggersOrLogLevelFilter(logging.Filter):
+#     """
+#     Logging filter accepting log records from (children of) loggers from a list or above certain log severity level
+#     """
+#     def __init__(self, loggers: Optional[List[str]] = None, level: Union[int, str] = logging.WARNING) -> None:
+#         self.loggers = loggers if loggers is not None else []
+#         self.level = level if isinstance(level, int) else getattr(logging, level)
+#
+#     def filter(self, record: logging.LogRecord) -> bool:
+#         if record.levelno >= self.level:
+#             return True
+#         for logger_name in self.loggers:
+#             logger_name_len = len(logger_name)
+#             if record.name.startswith(logger_name) and (len(record.name) == logger_name_len
+#                                                         or record.name[logger_name_len] == "."):
+#                 return True
+#         return False
+
+
+class StrFormatStyleMessageLogRecord(logging.LogRecord):
+
+    def getMessage(self) -> str:
+        """
+        Return the message for this LogRecord.
+
+        Return the message for this LogRecord after merging any user-supplied
+        arguments with the message by using str.format method.
+        """
+        msg = str(self.msg)
+        if self.args:
+            msg = msg.format(self.args)
+        return msg
+
+
+logging.setLogRecordFactory(StrFormatStyleMessageLogRecord)
+
+
+# TODO Annotate this function properly
+def opt_class(name: str):
+    def opt_class_decorator(cls):
+        opt_classes[name] = cls
+        return cls
+    return opt_class_decorator
+
+
+# TODO Use click instead, maybe together with click-config-file
+mod_arg_parser = ModuleArgumentParser()
+
+opt_input_file_arg_parser = mod_arg_parser.add_common_arg_parser("opt_input_file")
+opt_input_file_arg_parser.add_argument("file", help="YAML optimization input file from ./input directory")
+
+opt_signature_arg_parser = mod_arg_parser.add_common_arg_parser("opt_signature")
+opt_signature_arg_parser.add_argument("signature", help="optimization signature - name of subdirectory of ./output")
+
+
+yaml = ruamel.yaml.YAML()
+yaml.indent(mapping=4, sequence=6, offset=4)
+
+
+@mod_arg_parser.command("testcma")
 def test_cma_package() -> None:
-    """Tests cma package using doctest, according to http://cma.gforge.inria.fr/apidocs-pycma/cma.html"""
+    """Test cma package using doctest, according to http://cma.gforge.inria.fr/apidocs-pycma/cma.html"""
     print("Testing time (tests should run without complaints in about between 20 and 100 seconds):",
           timeit.timeit(stmt='cma.test.main()', setup="import cma.test", number=1))
 
@@ -108,12 +176,14 @@ def wait_for_graphs() -> None:
 
 
 def waiting_for_graphs(function: Callable[..., None]) -> Callable[..., None]:
+    @wraps(function)
     def wrapped(*args, **kwargs) -> None:
         function(*args, **kwargs)
         wait_for_graphs()
     return wrapped
 
 
+@mod_arg_parser.command("examplecmaplots")
 @waiting_for_graphs
 def example_cma_plots() -> None:
     """
@@ -213,17 +283,42 @@ class StreamToLogger:
         self.linebuf = ""
 
 
+class ExcludedLoggersFilter(logging.Filter):
+    """
+    Logging filter rejecting log records from (children of) loggers from a list
+    """
+    def __init__(self, loggers: Optional[List[str]] = None) -> None:
+        self.loggers = loggers if loggers is not None else []
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for logger_name in self.loggers:
+            logger_name_len = len(logger_name)
+            if record.name.startswith(logger_name) and (len(record.name) == logger_name_len
+                                                        or record.name[logger_name_len] == "."):
+                return False
+        return True
+
+
 class OptimizationFormatter(logging.Formatter):
     """
     Partly inspired by https://stackoverflow.com/questions/18639387/how-change-python-logging-to-display-time-passed
     -from-when-the-script-execution
     """
+    def __init__(self,
+                 fmt: Optional[str] = None,
+                 datefmt: Optional[str] = None,
+                 style: str = "%") -> None:
+        super().__init__(fmt, datefmt, style)
+        self.optimization_start = datetime.datetime.now()
+
     def format(self, record):
         # It seems that this method may be called multiple times when processing a log record, so modifying record's
         # attributes based on their previous values (e.g. extending a string) won't work as expected (can be done
         # multiple times).
         # Add attribute with readable running time (time since logging module was loaded)
-        time_diff = str(datetime.timedelta(milliseconds=record.relativeCreated))
+        # time_diff = str(datetime.timedelta(milliseconds=record.relativeCreated))
+        time_diff = str(datetime.datetime.now() - self.optimization_start)
+        # Add attribute with readable running time (time since logging was configured)
         record.runningTime = time_diff[:-3]
         # return super(OptimizationFormatter, self).format(record)
 
@@ -275,7 +370,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     # TODO Add names of the used files and directories as class attributes
     # rsa_output_dirname = "outrsa"
     # cmaes_output_dirname = "outcmaes"
-    # opt_input_filename = "optimization-input.json"
+    # opt_input_filename = "optimization-input.yaml"
     # gen_rsa_input_filename = "generated-rsa-input.txt"
     # cp_rsa_input_filename_prefix = "copied-rsa-input-"
     # rsa_sim_input_filename = "rsa-simulation-input.txt"
@@ -326,6 +421,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                  min_collectors_number: int = 10,
                  collectors_per_task: int = 1,
                  input_rel_path: str = None,
+                 output_dir: str = None,
                  output_to_file: bool = True,
                  output_to_stdout: bool = False,
                  log_generations: bool = True,
@@ -366,7 +462,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.signature = self.signature.replace(":", "-").replace(".", "_")
 
         # Create output directory and subdirectories for RSA and CMAES output
-        self.output_dir = _output_dir + "/" + self.signature
+        self.output_dir = (output_dir if output_dir is not None else _output_dir) + "/" + self.signature
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
         self.rsa_output_dir = self.output_dir + "/outrsa"
@@ -378,8 +474,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # Maybe use shutil instead
 
         # Generate used optimization input file in output directory
-        with open(self.output_dir + "/optimization-input.json", "w+") as opt_input_file:
-            json.dump(self.optimization_input, opt_input_file, indent=2)
+        with open(self.output_dir + "/optimization-input.yaml", "w+") as opt_input_file:
+            yaml.dump(self.optimization_input, opt_input_file)
 
         # Update self.rsa_parameters by optimization-type-specific parameters
         self.rsa_parameters.update(self.mode_rsa_parameters)
@@ -421,25 +517,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # for running rsa3d program in other process
         self.set_rsa_proc_arguments()
 
-        # Configure and set optimization state logger
-        # Logs can be printed to a logfile or to the standard output. By default, logfile will contain log records of
-        # severity level at least logging.INFO and standard output - at least logging.DEBUG.
-        with open(_cmaes_logging_config) as config_file:
-            logging_configuration = yaml.full_load(config_file)
-        if self.output_to_file:
-            # To set handlers' filename, modify configuration dictionary as below, try to set it to a variable in
-            # configuration file, use logger's addHandler method or modify logger.handlers[0] (probably it is not
-            # possible to specify file name after handler was instatiated)
-            logging_configuration["handlers"]["optimization_logfile"]["filename"] = self.output_dir\
-                + "/optimization-output.log"
-        else:
-            logging_configuration["loggers"]["optrsa.optimization"]["handlers"].pop(0)
-            del logging_configuration["handlers"]["optimization_logfile"]
-        if not self.output_to_stdout:
-            logging_configuration["loggers"]["optrsa.optimization"]["propagate"] = False
-        logging.config.dictConfig(logging_configuration)
-        self.logger = logging.getLogger("optrsa.optimization")
-        # Maybe optionally add a handler to print everything to the console
+        self.configure_logging()
+
         # TODO Maybe move these definitions to run method (then redirecting output will be done only in run method and
         #  CMAES initialization information will be added to output file).
         #  Then change here self.CMAES initialization to self.CMAES = None.
@@ -451,16 +530,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.candidate_num = 0
         # Redirect output - done here to catch CMAES initialization information. To be moved to run method together
         # with CMAES initialization
-        # if self.output_to_file:
-        self.stdout = sys.stdout
-        self.stderr = sys.stderr
-        # If a decorator for redirecting output were used, a "with" statement could have been used
-        # TODO Maybe create this file in self.CMAES.logger.name_prefix directory
-        # output_file = open(self.output_dir + "/" + self.signature + "_output.txt", "w+")
-        # output_file = open(self.output_dir + "/optimization-output.log", "w+")
-        sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
-        sys.stderr = StreamToLogger(logger=self.logger, log_level=logging.ERROR)
-        # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
+        self.redirect_output_to_logger()
         # Create CMA evolution strategy optimizer object
         # TODO Maybe add serving input files and default values for CMA-ES options (currently directly self.cma_options)
         self.logger.info(msg="Optimization class: {}".format(self.__class__.__name__))
@@ -484,8 +554,16 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # if self.okeanos:
         #     from mpi4py.futures import MPIPoolExecutor
         if self.okeanos_parallel and self.nodes_number is None:
-            # It is assumed that the SLURM job has the same number of assigned nodes
-            self.nodes_number = 1 + self.CMAES.popsize
+            slurm_job_num_nodes = os.getenv("SLURM_JOB_NUM_NODES")
+            if slurm_job_num_nodes is not None:
+                self.nodes_number = int(slurm_job_num_nodes)
+            else:
+                self.logger.warning(msg="Unable to get number of nodes allocated to the job; SLURM_JOB_NUM_NODES"
+                                        " environment variable is not set")
+                self.logger.warning(msg="Setting the value of the nodes_number attribute to 1 + (population"
+                                        " size)")
+                # It is assumed that the SLURM job has the same number of assigned nodes
+                self.nodes_number = 1 + self.CMAES.popsize
 
         # Create file for logging generation data
         self.opt_data_filename = self.output_dir + "/optimization.dat" if self.log_generations else None
@@ -521,6 +599,67 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             self.rsa_proc_args_last_param_index = len(self.rsa_proc_arguments)
             self.rsa_proc_arguments.extend([str(self.accuracy), self.output_filename])
 
+    def configure_logging(self) -> None:
+        # Configure and set optimization state logger
+        # Logs can be printed to a logfile or to the standard output. By default, logfile will contain log records of
+        # severity level at least logging.INFO and standard output - at least logging.DEBUG.
+        with open(_cmaes_logging_config) as config_file:
+            logging_configuration = yaml.load(config_file)
+        if self.output_to_file:
+            # To set handlers' filename, modify configuration dictionary as below, try to set it to a variable in
+            # configuration file, use logger's addHandler method or modify logger.handlers[0] (probably it is not
+            # possible to specify file name after handler was instantiated)
+            logging_configuration["handlers"]["optrsa_optimization_logfile"]["filename"] = self.output_dir \
+                + "/optimization-output.log"
+        else:
+            logging_configuration["loggers"]["optrsa.optimization"]["handlers"].pop(0)
+            del logging_configuration["handlers"]["optrsa_optimization_logfile"]
+        if self.output_to_stdout:
+            logging_configuration["loggers"]["optrsa.optimization"]["handlers"].append("debug_stdout")
+        logging.config.dictConfig(logging_configuration)
+        self.logger = logging.getLogger("optrsa.optimization")
+        # Configure root logger
+        if len(logging.root.handlers) == 1:
+            logging_root_handler = logging.root.handlers[0]
+            if isinstance(logging_root_handler, logging.StreamHandler) and logging_root_handler.stream == sys.stderr:
+                logging.root.removeHandler(logging_root_handler)
+        if not logging.root.hasHandlers():
+            formatter = self.logger.handlers[0].formatter
+            warnings_logfile_handler = logging.FileHandler(filename=self.output_dir + "/warnings.log")
+            warnings_logfile_handler.setLevel(logging.WARNING)
+            warnings_logfile_handler.setFormatter(formatter)
+            logging.root.addHandler(warnings_logfile_handler)
+            libraries_info_logfile_handler = logging.FileHandler(filename=self.output_dir + "/libraries_info.log")
+            libraries_info_logfile_handler.setLevel(logging.INFO)
+            libraries_info_logfile_handler.setFormatter(formatter)
+            libraries_info_logfile_handler.addFilter(ExcludedLoggersFilter(libraries_info_logfile_excluded_loggers))
+            logging.root.addHandler(libraries_info_logfile_handler)
+
+    def redirect_output_to_logger(self) -> None:
+        self.stdout = sys.stdout
+        self.stderr = sys.stderr
+        # If a decorator for redirecting output were used, a "with" statement could have been used
+        sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
+        sys.stderr = StreamToLogger(logger=self.logger, log_level=logging.ERROR)
+        # TODO Check, if earlier (more frequent) writing to output file can be forced (something like flush?)
+
+    @staticmethod
+    @abc.abstractmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        pass
+
+    @staticmethod
+    def create_optimization(optimization_input: dict):
+        # TODO Try to annotate the return type - -> RSACMAESOptimization does not work.
+        #  See https://stackoverflow.com/questions/44640479/mypy-annotation-for-classmethod-returning-instance
+        opt_class = opt_classes[optimization_input["opt_class"]]
+        opt_mode_args = optimization_input["opt_mode_args"]
+        opt_class_args = deepcopy(optimization_input["opt_class_args"])
+        initial_mean: np.ndarray = opt_class.get_initial_mean(opt_mode_args)
+        opt_class_args["initial_mean"] = initial_mean
+        opt_class_args["optimization_input"] = optimization_input
+        return opt_class(**opt_class_args)
+
     def __getstate__(self):
         """
         Method modifying pickling behaviour of the class' instance.
@@ -549,29 +688,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.__dict__.update(state)
 
         # Restore unpicklable attributes
-        # Configure and set optimization state logger
-        # TODO Check, if the file handler always appends to the file and doesn't truncate it at the beginning
-        with open(_cmaes_logging_config) as config_file:
-            logging_configuration = yaml.full_load(config_file)
-        if self.output_to_file:
-            # To set handlers' filename, modify configuration dictionary as below, try to set it to a variable in
-            # configuration file, use logger's addHandler method or modify logger.handlers[0] (probably it is not
-            # possible to specify file name after handler was instantiated)
-            logging_configuration["handlers"]["optimization_logfile"]["filename"] = self.output_dir \
-                                                                                    + "/optimization-output.log"
-        else:
-            logging_configuration["loggers"]["optrsa.optimization"]["handlers"].pop(0)
-            del logging_configuration["handlers"]["optimization_logfile"]
-        if not self.output_to_stdout:
-            logging_configuration["loggers"]["optrsa.optimization"]["propagate"] = False
-        logging.config.dictConfig(logging_configuration)
-        self.logger = logging.getLogger("optrsa.optimization")
+        self.configure_logging()
         # Redirect output
         # TODO Maybe separate redirecting output from unpickling in order to be able to unpickle and use standard output
-        self.stdout = sys.stdout
-        self.stderr = sys.stderr
-        sys.stdout = StreamToLogger(logger=self.logger, log_level=logging.INFO)
-        sys.stderr = StreamToLogger(logger=self.logger, log_level=logging.ERROR)
+        self.redirect_output_to_logger()
 
     def pickle(self, name: Optional[str] = None) -> None:
         pickle_name = "" if name is None else "-" + name
@@ -583,19 +703,16 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
     def unpickle(cls, signature: str):
         with open(_output_dir + "/" + signature + "/_" + cls.__name__ + ".pkl", "rb") as pickle_file:
             return pickle.load(pickle_file)
-        # Unpickling works outside of this module provided that the class of pickled object is imported, e.g.:
+        # Unpickling works outside this module provided that the class of pickled object is imported, e.g.:
         # "from optrsa import FixedRadiiXYPolydiskRSACMAESOpt".
-        # TODO Maybe add a method or program mode to unpickle optimization object, change CMA-ES options such as
-        #  termination condition and resume optimization - probably run method will work fine
 
     @classmethod
     def set_optimization_class_attributes(cls, signature: Optional[str] = None,
                                           optimization_input: Optional[dict] = None):
         if optimization_input is None:
             # Get optimization input data from optimization directory
-            with open(_output_dir + "/" + signature + "/optimization-input.json", "r") as opt_input_file:
-                # TODO Maybe use configparser module or YAML format instead
-                optimization_input = json.load(opt_input_file)
+            with open(_output_dir + "/" + signature + "/optimization-input.yaml", "r") as opt_input_file:
+                optimization_input = yaml.load(opt_input_file)
 
         # Set optimization class attibutes (class attributes with suffix "_optclattr") using optimization input data
         # Based on https://www.geeksforgeeks.org/how-to-get-a-list-of-class-attributes-in-python/
@@ -882,7 +999,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             #  (self.simulations_num should be fine to ensure distinction)
             # Create subdirectory for output of rsa3d program in this simulation.
             # simulation_labels contain generation number, candidate number and evaluation number.
-            simulation_output_dir = self.rsa_output_dir + "/" + "_".join(simulation_labels.split(",")[:3])
+            simulation_output_dir = self.rsa_output_dir + "/{:03d}_{:02d}_{:04d}" \
+                .format(*map(int, simulation_labels.split(",")[:3]))
             if not os.path.exists(simulation_output_dir):
                 os.makedirs(simulation_output_dir)
                 # Maybe use shutil instead
@@ -1167,8 +1285,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             rsa_proc_arguments.extend(["-from=" + str(first_collector_num), "-collectors=" + str(collectors_num),
                                        "-appendToDat=true"])
             # Create a file for saving the output of rsa3d program
-            simulation_output_dir = self.rsa_output_dir + "/" + str(self.CMAES.countiter) + "_" + str(candidate_num) \
-                + "_" + str(simulation_num)
+            simulation_output_dir = self.rsa_output_dir + "/{:03d}_{:02d}_{:04d}".format(self.CMAES.countiter,
+                                                                                         candidate_num,
+                                                                                         simulation_num)
             collectors_filename_info = "collector"
             if collectors_num == 1:
                 collectors_filename_info += "-" + str(first_collector_num)
@@ -1307,8 +1426,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # For each simulation create a subdirectory for output of rsa3d program and rsa3d input file
         for candidate_num, simulation_num, particle_attributes in zip(candidates_numbers, simulations_numbers,
                                                                       cand_particle_attributes):
-            simulation_output_dir = self.rsa_output_dir + "/" + str(self.CMAES.countiter) + "_" + str(candidate_num) \
-                + "_" + str(simulation_num)
+            simulation_output_dir = self.rsa_output_dir + "/{:03d}_{:02d}_{:04d}".format(self.CMAES.countiter,
+                                                                                         candidate_num,
+                                                                                         simulation_num)
             if not os.path.exists(simulation_output_dir):
                 os.makedirs(simulation_output_dir)
             # Create rsa3d input file containing simulation-specific parameters in the simulation output directory
@@ -1684,9 +1804,10 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
             #     prev_collector_id = collector_id
             if unused_collectors_ids.size > 0:
                 # TODO Maybe log a warning
-                simulation_output_dir = self.rsa_output_dir + "/" + str(self.CMAES.countiter) \
-                                        + "_" + str(candidates_numbers[simulation_index]) \
-                                        + "_" + str(simulations_numbers[simulation_index])
+                simulation_output_dir = self.rsa_output_dir \
+                                        + "/{:03d}_{:02d}_{:04d}".format(self.CMAES.countiter,
+                                                                         candidates_numbers[simulation_index],
+                                                                         simulations_numbers[simulation_index])
                 with open(simulation_output_dir + "/unused_collectors.txt", "w") as unused_collectors_file:
                     unused_collectors_file.writelines("{}\n".format(id) for id in unused_collectors_ids)
 
@@ -1880,14 +2001,14 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
 
         config_file_path = _output_dir + "/" + signature + "/" + config_file_name
         with open(config_file_path) as config_file:
-            graph_config = yaml.full_load(config_file)
+            graph_config = yaml.load(config_file)
         # TODO Maybe use fig, ax = plt.subplots() and plot on axes
         # fig, ax = plt.subplots()
         # plt.rcParams["axes.autolimit_mode"] = "round_numbers"
         plt.rcParams["text.usetex"] = True
         plt.rcParams["font.family"] = "serif"
         plt.rcParams["font.size"] = graph_config["font_size"]
-        fig = plt.figure(num=args.signature, figsize=graph_config["graph_size"])  # figsize is given in inches
+        fig = plt.figure(num=signature, figsize=graph_config["graph_size"])  # figsize is given in inches
         # (10, 6.5)
         ax = plt.axes()
         # plt.title("CMA-ES optimization of RSA mean packing fraction\nof fixed-radii polydisks")
@@ -2452,7 +2573,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         self.CMAES.result_pretty()
         # Pickling of the object
         self.pickle()
-        termination_condition = "-".join(["{}-{}".format(key, val) for key, val in self.CMAES.result.stop.items()])\
+        termination_condition = "-".join(["{}-{}".format(key, val) for key, val in self.CMAES.result.stop.items()]) \
             .replace(".", "_")
         self.pickle(name="gen-{}-term-{}".format(self.CMAES.countiter - 1, termination_condition))
 
@@ -2464,6 +2585,22 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         # if self.output_to_file:
         sys.stdout = self.stdout
         sys.stderr = self.stderr
+
+    def get_result(self) -> Tuple[str, float]:
+        """Method returning tuple with particle attributes and packing fraction of the best particle in optimization"""
+        opt_data_filename = self.output_dir + "/optimization.dat"
+        # Prepare optimization data file if it does not exist
+        if not os.path.isfile(opt_data_filename):
+            self.save_optimization_data(signature=self.signature)
+        # Loading optimization data using pd.read_table
+        # Alternatively pass filepath_or_buffer=opt_data_filename to pd.read_table
+        with open(opt_data_filename) as opt_data_file:
+            optimization_data = pd.read_table(filepath_or_buffer=opt_data_file,
+                                              index_col="generationnum",
+                                              dtype=self.optimization_data_columns)
+        best_generation_num: int = optimization_data["bestpfrac"].idxmax()
+        best_generation_data: pd.Series = optimization_data.loc[best_generation_num]
+        return best_generation_data["bestpartattrs"], best_generation_data["bestpfrac"]
 
 
 class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
@@ -2743,13 +2880,13 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
                             intersection_points_indices.append(point_index)
 
             # =============
-            print(disks_indices)
+            # print(disks_indices)
             # =============
             # Check, if disks are disjoint:
             if len(intersection_points_indices) == 0:
                 # =============
-                print("Disjoint")
-                print()
+                # print("Disjoint")
+                # print()
                 # =============
                 return 0
 
@@ -2760,7 +2897,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
             # Find the order in which the intersection points form a convex polygon
             vertices = intersection_points.loc[intersection_points_indices]
             # =============
-            print(vertices)
+            # print(vertices)
             # =============
             center_point = vertices.mean()
             vertices -= center_point
@@ -2812,7 +2949,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
                 else:
                     disk_index = first_int_point_index[1]
                 # ============
-                print("Disk index: {}".format(disk_index))
+                # print("Disk index: {}".format(disk_index))
                 # ============
                 # Calculate area of the "cap"
                 disk = disks.iloc[disk_index]
@@ -2822,9 +2959,9 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
                 second_int_point = intersection_points.loc[second_int_point_index]
                 int_point_vectors_product = np.cross(first_int_point - origin, second_int_point - origin)
                 # ============
-                print("First point index: {}".format(first_int_point_index))
-                print("Second point index: {}".format(second_int_point_index))
-                print("Vector product: {}".format(int_point_vectors_product))
+                # print("First point index: {}".format(first_int_point_index))
+                # print("Second point index: {}".format(second_int_point_index))
+                # print("Vector product: {}".format(int_point_vectors_product))
                 # ============
                 smaller_part_of_disk = int_point_vectors_product >= 0
                 if not smaller_part_of_disk:
@@ -2838,12 +2975,12 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
                 # Add area of the "cap"
                 area += cap_area
                 # ============
-                print("Triangle area: {}, arc area: {}, cap area: {}, partial intersection area: {}"
-                      .format(triangle_area, arc_area, cap_area, triangle_area + cap_area))
+                # print("Triangle area: {}, arc area: {}, cap area: {}, partial intersection area: {}"
+                #       .format(triangle_area, arc_area, cap_area, triangle_area + cap_area))
                 # ============
             # ============
-            print("Intersection area: {}".format(area))
-            print()
+            # print("Intersection area: {}".format(area))
+            # print()
             # ============
             return area
 
@@ -2870,7 +3007,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         coordinates_type, disks_params = cls.arg_to_polydisk_attributes(arg)
         disks_num = disks_params.size // 3
         # area = cls.wolfram_polydisk_area(disks_params)
-        area = cls.wolframclient_polydisk_area(disks_params)
+        area = cls.analytical_polydisk_area(disks_params)
         particle_attributes_list = [str(disks_num), coordinates_type]
         # TODO Maybe do it in a more simple way
         particle_attributes_list.extend(disks_params.astype(np.unicode).tolist())
@@ -2878,6 +3015,7 @@ class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
         return " ".join(particle_attributes_list)
 
 
+@opt_class("Frpd")
 class FixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
     """
     Class for performing CMA-ES optimization of packing fraction of RSA packings built of unions of disks
@@ -2898,6 +3036,10 @@ class FixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         return "disks-" + str(disks_num) + "-initstds-" + str(self.initial_stddevs)
 
     # TODO Check, if constructor has to be overwritten
+
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_fixed_radii_disks(opt_mode_args)
 
     @classmethod
     def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
@@ -2925,6 +3067,7 @@ class FixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         return stddevs_with_radii
 
 
+@opt_class("Cfrpd")
 class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
     """
     Class for performing CMA-ES optimization of packing fraction of RSA packings built of unions of disks
@@ -2945,6 +3088,10 @@ class ConstrFixedRadiiXYPolydiskRSACMAESOpt(PolydiskRSACMAESOpt):
         return "disks-" + str(disks_num) + "-initstds-" + str(self.initial_stddevs)
 
     # TODO Check, if constructor has to be overwritten
+
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_constr_fixed_radii_disks(opt_mode_args)
 
     @classmethod
     def arg_to_particle_parameters(cls, arg: np.ndarray) -> np.ndarray:
@@ -3689,7 +3836,7 @@ class RoundedPolygonRSACMAESOpt(PolygonRSACMAESOpt, metaclass=abc.ABCMeta):
                             shrinkA=0,
                             shrinkB=0)
                         drawing_area.add_artist(std_dev_arrow)
-                    
+
         return drawing_area
 
 
@@ -3716,9 +3863,14 @@ class VariableRadiiRoundedPolygonRSACMAESOpt(RoundedPolygonRSACMAESOpt, metaclas
         return softplus(stddevs[0]), stddevs[1:]
 
 
+@opt_class("Cfrcpg")
 class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
                                                         ConstrXYConvexPolygonRSACMAESOpt):
 
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_constr_vertices(opt_mode_args)
+
     @classmethod
     def swap_arg(cls, arg: np.ndarray) -> np.ndarray:
         radius, polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)
@@ -3727,14 +3879,23 @@ class ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(FixedRadiiRoundedPolygon
         return swapped_arg
 
 
+@opt_class("Cfrsspg")
 class ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(FixedRadiiRoundedPolygonRSACMAESOpt,
                                                             ConstrXYStarShapedPolygonRSACMAESOpt):
-    pass
+
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_constr_vertices(opt_mode_args)
 
 
+@opt_class("Cvrcpg")
 class ConstrXYVariableRadiiRoundedConvexPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
                                                            ConstrXYConvexPolygonRSACMAESOpt):
 
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_polygon_rounding(initial_mean_constr_vertices(opt_mode_args), opt_mode_args)
+
     @classmethod
     def swap_arg(cls, arg: np.ndarray) -> np.ndarray:
         radius, polygon_arg = cls.arg_to_radius_and_polygon_arg(arg)
@@ -3743,153 +3904,108 @@ class ConstrXYVariableRadiiRoundedConvexPolygonRSACMAESOpt(VariableRadiiRoundedP
         return swapped_arg
 
 
+@opt_class("Cvrsspg")
 class ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
                                                                ConstrXYStarShapedPolygonRSACMAESOpt):
-    pass
+
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_polygon_rounding(initial_mean_constr_vertices(opt_mode_args), opt_mode_args)
 
 
+@opt_class("Vrutpg")
 class VariableRadiiRoundedUniformTPolygonRSACMAESOpt(VariableRadiiRoundedPolygonRSACMAESOpt,
                                                      UniformTPolygonRSACMAESOpt):
-    pass
+
+    @staticmethod
+    def get_initial_mean(opt_mode_args: dict) -> np.ndarray:
+        return initial_mean_polygon_rounding(initial_mean_uniform_t_vertices(opt_mode_args), opt_mode_args)
 
 
-def optimize() -> None:
-
-    def opt_fixed_radii() -> None:
-        initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["disks_num"])
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        fixed_radii_polydisk_opt = FixedRadiiXYPolydiskRSACMAESOpt(**opt_class_args)
-        fixed_radii_polydisk_opt.run()
-
-    def opt_constr_fixed_radii() -> None:
-        initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["disks_num"] - 3)
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        constr_fixed_radii_polydisk_opt = ConstrFixedRadiiXYPolydiskRSACMAESOpt(**opt_class_args)
-        constr_fixed_radii_polydisk_opt.run()
-
-    def opt_constr_fixed_radii_convex_polygon() -> None:
-        initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedConvexPolygonRSACMAESOpt(**opt_class_args)
-        constr_fixed_radii_polygon_opt.run()
-
-    def opt_constr_variable_radii_convex_polygon() -> None:
-        if optimization_input["opt_mode_args"]["polygon_initial_mean"] == "origin":
-            polygon_initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
-        elif optimization_input["opt_mode_args"]["polygon_initial_mean"] == "regular_polygon":
-            vertices_num = optimization_input["opt_mode_args"]["vertices_num"]
-            polygon_radius = optimization_input["opt_mode_args"]["initial_mean_params"]["polygon_radius"]
-            angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
-            vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([polygon_radius * np.cos(angle),
-                                                                                   polygon_radius * np.sin(angle)]),
-                                                    axis=0,
-                                                    arr=angles).T
-            shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
-            vertices = vertices_centered + np.array([polygon_radius * np.cos(shift_angle),
-                                                     polygon_radius * np.sin(shift_angle)])
-            polygon_initial_mean = vertices.flatten()[:-3]
-        initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        constr_variable_radii_polygon_opt = ConstrXYVariableRadiiRoundedConvexPolygonRSACMAESOpt(**opt_class_args)
-        constr_variable_radii_polygon_opt.run()
-
-    def opt_constr_fixed_radii_star_shaped_polygon() -> None:
-        if optimization_input["opt_mode_args"]["initial_mean"] == "origin":
-            initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
-        elif optimization_input["opt_mode_args"]["initial_mean"] == "regular_polygon":
-            vertices_num = optimization_input["opt_mode_args"]["vertices_num"]
-            radius = optimization_input["opt_mode_args"]["initial_mean_params"]["radius"]
-            angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
-            vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([radius * np.cos(angle),
-                                                                                   radius * np.sin(angle)]),
-                                                    axis=0,
-                                                    arr=angles).T
-            shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
-            vertices = vertices_centered + np.array([radius * np.cos(shift_angle), radius * np.sin(shift_angle)])
-            initial_mean = vertices.flatten()[:-3]
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        constr_fixed_radii_polygon_opt = ConstrXYFixedRadiiRoundedStarShapedPolygonRSACMAESOpt(**opt_class_args)
-        constr_fixed_radii_polygon_opt.run()
-
-    def opt_constr_variable_radii_star_shaped_polygon() -> None:
-        if optimization_input["opt_mode_args"]["polygon_initial_mean"] == "origin":
-            polygon_initial_mean = np.zeros(2 * optimization_input["opt_mode_args"]["vertices_num"] - 3)
-        elif optimization_input["opt_mode_args"]["polygon_initial_mean"] == "regular_polygon":
-            vertices_num = optimization_input["opt_mode_args"]["vertices_num"]
-            polygon_radius = optimization_input["opt_mode_args"]["initial_mean_params"]["polygon_radius"]
-            angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
-            vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([polygon_radius * np.cos(angle),
-                                                                                   polygon_radius * np.sin(angle)]),
-                                                    axis=0,
-                                                    arr=angles).T
-            shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
-            vertices = vertices_centered + np.array([polygon_radius * np.cos(shift_angle),
-                                                     polygon_radius * np.sin(shift_angle)])
-            polygon_initial_mean = vertices.flatten()[:-3]
-        initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        constr_variable_radii_polygon_opt = ConstrXYVariableRadiiRoundedStarShapedPolygonRSACMAESOpt(**opt_class_args)
-        constr_variable_radii_polygon_opt.run()
-
-    def opt_variable_radii_uniform_t_polygon() -> None:
-        if optimization_input["opt_mode_args"]["polygon_initial_mean"] == "regular_polygon":
-            polygon_initial_mean = np.full(shape=optimization_input["opt_mode_args"]["vertices_num"],
-                                           fill_value=optimization_input["opt_mode_args"]["initial_mean_params"]
-                                               ["polygon_radius"])
-        initial_mean = np.insert(polygon_initial_mean, 0, optimization_input["opt_mode_args"]["rounding_initial_mean"])
-        opt_class_args = dict(optimization_input["opt_class_args"])  # Use dict constructor to copy by value
-        opt_class_args["initial_mean"] = initial_mean
-        opt_class_args["optimization_input"] = optimization_input
-        variable_radii_polygon_opt = VariableRadiiRoundedUniformTPolygonRSACMAESOpt(**opt_class_args)
-        variable_radii_polygon_opt.run()
+def initial_mean_fixed_radii_disks(opt_mode_args: dict) -> np.ndarray:
+    return np.zeros(2 * opt_mode_args["disks_num"])
 
 
-    opt_modes = {
-        "optfixedradii": opt_fixed_radii,
-        "optconstrfixedradii": opt_constr_fixed_radii,
-        "optconstrfixedradiiconvexpolygon": opt_constr_fixed_radii_convex_polygon,
-        "optconstrfixedradiistarshapedpolygon": opt_constr_fixed_radii_star_shaped_polygon,
-        "optconstrvariableradiiconvexpolygon": opt_constr_variable_radii_convex_polygon,
-        "optconstrvariableradiistarshapedpolygon": opt_constr_variable_radii_star_shaped_polygon,
-        "optvariableradiiuniformtpolygon": opt_variable_radii_uniform_t_polygon,
-    }
-    if args.file is None:
-        raise TypeError("In optimize mode input file has to be specified using -f argument")
-    with open(_input_dir + "/" + args.file, "r") as opt_input_file:
-        # TODO Maybe use configparser module or YAML format instead
-        optimization_input = json.load(opt_input_file)
-    opt_modes[optimization_input["opt_mode"]]()
+def initial_mean_constr_fixed_radii_disks(opt_mode_args: dict) -> np.ndarray:
+    return np.zeros(2 * opt_mode_args["disks_num"] - 3)
 
 
-def plot_cmaes_optimization_data() -> None:
-    if args.signature is None:
-        raise TypeError("In plotcmaesoptdata mode optimization signature has to be specified using -s argument")
-    opt_class_name = args.signature.split("-")[5]
+def initial_mean_constr_vertices(opt_mode_args: dict) -> np.ndarray:
+    if opt_mode_args["polygon_initial_mean"] == "origin":
+        return np.zeros(2 * opt_mode_args["vertices_num"] - 3)
+    elif opt_mode_args["polygon_initial_mean"] == "regular_polygon":
+        vertices_num = opt_mode_args["vertices_num"]
+        polygon_radius = opt_mode_args["initial_mean_params"]["polygon_radius"]
+        angles = np.pi * (3 / 2 - np.arange(start=3, stop=2 * vertices_num + 2, step=2) / vertices_num)
+        vertices_centered = np.apply_along_axis(func1d=lambda angle: np.array([polygon_radius * np.cos(angle),
+                                                                               polygon_radius * np.sin(angle)]),
+                                                axis=0,
+                                                arr=angles).T
+        shift_angle = np.pi * (1 / 2 - 1 / vertices_num)
+        vertices = vertices_centered + np.array([polygon_radius * np.cos(shift_angle),
+                                                 polygon_radius * np.sin(shift_angle)])
+        return vertices.flatten()[:-3]
+
+
+def initial_mean_uniform_t_vertices(opt_mode_args: dict) -> np.ndarray:
+    if opt_mode_args["polygon_initial_mean"] == "regular_polygon":
+        return np.full(shape=opt_mode_args["vertices_num"],
+                       fill_value=opt_mode_args["initial_mean_params"]["polygon_radius"])
+
+
+def initial_mean_polygon_rounding(polygon_initial_mean: np.ndarray, opt_mode_args: dict) -> np.ndarray:
+    return np.insert(polygon_initial_mean, 0, opt_mode_args["rounding_initial_mean"])
+
+
+def load_optimization_input(file: str) -> dict:
+    with open(_input_dir + "/" + file, "r") as opt_input_file:
+        return yaml.load(opt_input_file)
+
+
+@mod_arg_parser.command(parsers=["opt_input_file"])
+def optimize(file: str) -> None:
+    """Run optimization"""
+    optimization_input = load_optimization_input(file)
+    optimization = RSACMAESOptimization.create_optimization(optimization_input)
+    optimization.run()
+
+
+@mod_arg_parser.argument("optimization_link",
+                         help="file with optimization signature from ./input directory")
+@mod_arg_parser.command("initializeopt", parsers=["opt_input_file"])
+def initialize_optimization(file: str, optimization_link: str) -> None:
+    """Initialize optimization"""
+    optimization_input = load_optimization_input(file)
+    optimization = RSACMAESOptimization.create_optimization(optimization_input)
+    optimization.pickle()
+    print("Optimization signature: {}".format(optimization.signature), file=optimization.stdout)
+    with open(_input_dir + "/" + optimization_link, "w+") as opt_signature_file:
+        opt_signature_file.write(optimization.signature)
+
+
+# TODO Maybe do it in another way
+@mod_arg_parser.argument("-c", "--config",
+                         help="name of graph configuration YAML file from optimization directory")
+@mod_arg_parser.command("plotcmaesoptdata", parsers=["opt_signature"])
+def plot_cmaes_optimization_data(signature: str, config: Optional[str] = None) -> None:
+    """Plot CMA-ES optimization data"""
+    opt_class_name = signature.split("-")[5]
     # Get optimization class from current module.
     # If the class is not in current module, module's name has to be passed as sys.modules dictionary's key,
     # so such classes should put the module name to optimization signature.
     opt_class = getattr(sys.modules[__name__], opt_class_name)
-    opt_class.set_optimization_class_attributes(signature=args.signature)
-    config_file_name = args.config if args.config is not None else "graph_config.yaml"
-    opt_class.plot_optimization_data(signature=args.signature, config_file_name=config_file_name)
+    opt_class.set_optimization_class_attributes(signature=signature)
+    config_file_name = config if config is not None else "graph_config.yaml"
+    opt_class.plot_optimization_data(signature=signature, config_file_name=config_file_name)
 
 
-def resume_optimization() -> None:
-    if args.signature is None:
-        raise TypeError("In resumeoptimization mode optimization signature has to be specified using -s argument")
-    opt_class_name = args.signature.split("-")[5]
+# TODO Test and improve it
+@mod_arg_parser.argument("-f", "--file",
+                         help="YAML resume-optimization input file from ./input directory")
+@mod_arg_parser.command("resumeoptimization", parsers=["opt_signature"])
+def resume_optimization(signature: str, file: Optional[str] = None) -> None:
+    """Resume optimization"""
+    opt_class_name = signature.rpartition("/")[2].split("-")[5]
     # Get optimization class from current module.
     # If the class is not in current module, module's name has to be passed as sys.modules dictionary's key,
     # so such classes should put the module name to optimization signature. Such a class also needs to be explicitly
@@ -3899,11 +4015,11 @@ def resume_optimization() -> None:
     # "-restart-1" suffix at the end of the directory name, then (maybe it is necessary - check it) removing directories
     # in outrsa subdirectory corresponding to simulations in interrupted generation, maybe also removing some entries in
     # files in outcmaes subdirectory (check, if the call to self.CMAES.logger.add at the beginning of run method won't
-    # spoil anything (it will cause duplicated CMA-ES generation data records).
+    # spoil anything (it will cause duplicated CMA-ES generation data records)).
     # But many classes' attributes depend on optimization directory - that's why it is better currently to duplicate
     # original optimization directory and add "-original" suffix at the end of the copied directory name and resume
     # optimization in original directory
-    optimization = opt_class.unpickle(args.signature)
+    optimization = opt_class.unpickle(signature)
     optimization.logger.info(msg="")
     optimization.logger.info(msg="")
     optimization.logger.info(msg="Resuming optimization")
@@ -3927,10 +4043,9 @@ def resume_optimization() -> None:
     # Set optimization class attributes
     optimization.set_optimization_class_attributes(optimization_input=optimization.optimization_input)
     # Overwrite optimization options, if the file argument was given
-    if args.file is not None:
-        with open(_input_dir + "/" + args.file, "r") as opt_input_file:
-            # TODO Maybe use configparser module or YAML format instead
-            resume_input = json.load(opt_input_file)
+    if file is not None:
+        with open(_input_dir + "/" + file, "r") as opt_input_file:
+            resume_input = yaml.load(opt_input_file)
         # TODO Test it
         if "cma_options" in resume_input:
             # After unpickling output is redirected to logger, so CMAEvolutionStrategy classes' errors and warnings
@@ -3962,30 +4077,30 @@ def resume_optimization() -> None:
                                                                optimization.CMAES.popsize) \
                     if optimization.max_nodes_number is not None else optimization.CMAES.popsize
         # TODO Set (and maybe check) other attributes, if needed
-        if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) or "accuracy" in resume_input\
-                or "okeanos_parallel" in resume_input:
+        if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) \
+                or "accuracy" in resume_input or "okeanos_parallel" in resume_input:
             # All attributes that are used in optimization.rsa_proc_arguments have to be set already, if present
             optimization.set_rsa_proc_arguments()
         # Generate used optimization input file in output directory
-        resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds").replace(":", "-")\
+        resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds").replace(":", "-") \
             .replace(".", "_")
         resume_signature += "-optimization-resume-gen-{}".format(optimization.CMAES.countiter)
-        opt_input_filename = optimization.output_dir + "/" + resume_signature + "-input.json"
+        opt_input_filename = optimization.output_dir + "/" + resume_signature + "-input.yaml"
         with open(opt_input_filename, "w+") as opt_input_file:
-            json.dump(resume_input, opt_input_file, indent=2)
-        optimization.logger.info(msg="Optimization resume input file: {}-input.json".format(resume_signature))
+            yaml.dump(resume_input, opt_input_file)
+        optimization.logger.info(msg="Optimization resume input file: {}-input.yaml".format(resume_signature))
         if "rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0:
             rsa_input_filename = optimization.output_dir + "/" + resume_signature + "-rsa-input.txt"
             with open(rsa_input_filename, "w+") as rsa_input_file:
                 # TODO Maybe use resume_input["rsa_parameters"] instead
-                rsa_parameters = optimization.rsa_parameters if optimization.input_given\
+                rsa_parameters = optimization.rsa_parameters if optimization.input_given \
                     else optimization.all_rsa_parameters
                 rsa_input_file.writelines(["{} = {}\n".format(param_name, param_value)
                                            for param_name, param_value in rsa_parameters.items()])
             optimization.logger.info(msg="Resume RSA input file: {}-rsa-input.txt".format(resume_signature))
     # If optimization is to be run on Okeanos in parallel mode, try to set nodes_number attribute to the number of nodes
     # actually allocated to the SLURM job, unless nodes_number was given in resume input file
-    if optimization.okeanos_parallel and (args.file is None or "nodes_number" not in resume_input):
+    if optimization.okeanos_parallel and (file is None or "nodes_number" not in resume_input):
         slurm_job_num_nodes = os.getenv("SLURM_JOB_NUM_NODES")
         if slurm_job_num_nodes is not None:
             optimization.nodes_number = int(slurm_job_num_nodes)
@@ -4021,31 +4136,5 @@ def resume_optimization() -> None:
 # TODO Think, if demanding given accuracy (rsa3d accuracy mode) is the right thing to do
 # TODO Check, if rsa3d options are well chosen (especially split) and wonder, if they should be somehow
 #  automatically adjusted during optimization
-if __name__ == '__main__':
-    module_description = "Optimization of packing fraction of two-dimensional Random Sequential Adsorption (RSA)" \
-                         " packings\nusing Covariance Matrix Adaptation Evolution Strategy (CMA-ES)."
-    # TODO Maybe automate adding modes, for example using (parametrized) decorators
-    module_modes = {
-        "testcma": test_cma_package,
-        "examplecmaplots": example_cma_plots,
-        "optimize": optimize,
-        # TODO Maybe do it in another way
-        "plotcmaesoptdata": plot_cmaes_optimization_data,
-        # TODO Test and improve it
-        "resumeoptimization": resume_optimization
-    }
-    arg_parser = argparse.ArgumentParser(description=module_description)
-    # TODO Maybe use sub-commands for modes (arg_parser.add_subparsers)
-    arg_parser.add_argument("mode", choices=list(module_modes), help="program mode")
-    # TODO Make this argument obligatory for optimize mode
-    arg_parser.add_argument("-f", "--file", help="json input file from ./input directory")
-    # TODO Make this argument obligatory for plotcmaesoptdata mode
-    arg_parser.add_argument("-s", "--signature", help="optimization signature - name of subdirectory of ./output")
-    # TODO Make this argument available only in plotcmaesoptdata mode
-    # arg_parser.add_argument("-m", "--modulo", help="Annotate points with particles drawings in first, last and every"
-    #                                                " modulo generation. If not given,"
-    #                                                " modulo will be automatically adjusted.")
-    # TODO Make this argument available only in plotcmaesoptdata mode
-    arg_parser.add_argument("-c", "--config", help="name of graph configuration YAML file from optimization directory")
-    args = arg_parser.parse_args()
-    module_modes[args.mode]()
+if __name__ == "__main__":
+    mod_arg_parser()

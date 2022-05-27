@@ -1,0 +1,14 @@
+parameters:
+    opt_mode_args:
+        initial_mean_params:
+            polygon_radius: !param
+                range: [1, 15]
+        rounding_initial_mean: 1
+    opt_class_args:
+        stddevs_sample_size: !param
+            range: [1e4, 1e6]
+            scale: log
+        cma_options:
+            popsize: 4
+gpyopt_options:
+    max_num_trials: 7
