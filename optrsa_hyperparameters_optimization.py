@@ -4,7 +4,7 @@ of packing fraction of two-dimensional Random Sequential Adsorption (RSA) packin
 """
 import sherpa
 
-from typing import Optional
+from typing import Optional, Tuple
 import datetime
 import os
 import ruamel.yaml
@@ -19,7 +19,31 @@ from copy import deepcopy
 import pickle
 from mergedeep import merge
 from module_arg_parser import ModuleArgumentParser
+import pandas as pd
 
+import matplotlib
+import subprocess
+# PyCharm Professional sets other backend, which may cause trouble
+if sys.platform.startswith('darwin'):  # MacOS
+    # See https://matplotlib.org/tutorials/introductory/usage.html#backends
+    matplotlib.use("MacOSX")
+    # Qt5Agg, Qt4Agg - can't import qt bindings, GTK3Agg, GTK3Cairo - can't install all dependencies. nbAgg - fails.
+    # WX does not have access to the screen. TkAgg works, WebAgg (with tornado imported) works worse than TkAgg.
+else:
+    try:
+        # TODO Maybe use platform module instead
+        system_info = subprocess.check_output(["uname", "-mrs"]).decode().strip()
+    except Exception as exception:
+        system_info = "not checked"
+    okeanos_system_info = "Linux 4.12.14-150.17_5.0.86-cray_ari_s x86_64"
+    if system_info != okeanos_system_info and system_info != "not checked":
+        # Partially tested
+        matplotlib.use("Qt5Agg")  # Maybe try also TkAgg (works) if interactivity is needed. Agg is not interactive.
+import matplotlib.pyplot as plt
+# import matplotlib.transforms
+# import matplotlib.offsetbox
+# import matplotlib.patches
+# import matplotlib.text
 
 # Get absolute path to optrsa project directory
 _proj_dir = os.path.dirname(__file__)
@@ -127,6 +151,8 @@ class RSACMAESOptHyperparametersOptimization:
         # TODO Maybe move these definitions to run method
         # Redirect output. To be moved to run method
         self.redirect_output_to_logger()
+
+        self.logger.info(msg="Initializing optimization")
 
         # Settings for parallel computation
         # TODO Check, if using this parameter is necessary
@@ -279,7 +305,56 @@ class RSACMAESOptHyperparametersOptimization:
         # Unpickling works outside this module provided that the class of pickled object and
         # HyperparameterConfiguration class are imported.
 
-    def _evaluate_trial(self) -> float:
+    @classmethod
+    def plot_optimization_data(cls, signature: str, config_file_name: str) -> None:
+        opt_data_filename = _output_dir + "/" + signature + "/results.csv"
+        all_status_optimization_data = pd.read_csv(filepath_or_buffer=opt_data_filename, index_col="Trial-ID")
+        # Consider only records with Status COMPLETED
+        optimization_data = all_status_optimization_data[all_status_optimization_data["Status"] == "COMPLETED"]
+
+        config_file_path = _output_dir + "/" + signature + "/" + config_file_name
+        with open(config_file_path) as config_file:
+            graph_config = yaml.load(config_file)
+
+        plt.rcParams["text.usetex"] = True
+        plt.rcParams["font.family"] = "serif"
+        plt.rcParams["font.size"] = graph_config["font_size"]
+        # TODO Check, if fig variable is needed
+        fig = plt.figure(num=signature, figsize=graph_config["graph_size"])  # figsize is given in inches
+        ax = plt.axes()
+        # plt.title("CMA-ES optimization of RSA mean packing fraction\nof fixed-radii polydisks")
+        plt.ylabel("Best packing fraction")
+        plt.xlabel("Iteration number")
+        # TODO Try to adjust ticks automatically
+        ax.tick_params(direction="in", right=True, top=True)
+        plt.errorbar(x=optimization_data.index, y=optimization_data["Objective"],
+                     yerr=optimization_data["Objective-Std-Dev"],
+                     fmt="ko-", capsize=2, label="Best packing fraction")
+        plt.grid()
+        # TODO Maybe delete it, if it will not be necessary
+        handles, labels = ax.get_legend_handles_labels()
+        leg = plt.legend(reversed(handles), reversed(labels))
+        leg.set_draggable(True)
+        data_len = len(optimization_data["Objective"])
+        drawings_scale = graph_config["drawings_scale"]
+        modulo = graph_config.get("modulo")
+        if modulo is None:
+            modulo = max(int(data_len * drawings_scale), 1)
+        gen_nums = list(range(1, data_len, modulo))
+        if data_len - 1 not in gen_nums:
+            gen_nums.append(data_len - 1)
+        plt.xticks(gen_nums)
+        # TODO Adjust top limit so that it corresponds to a major tick
+        plt.locator_params(axis="y", nbins=15)
+        bottom_lim, top_lim = ax.get_ylim()
+        bottom_space = graph_config["bottom_space"]
+        top_space = graph_config["top_space"]
+        ax.set_ylim(bottom_lim - bottom_space / (1. - top_space - bottom_space) * (top_lim - bottom_lim),
+                    top_lim + top_space / (1. - top_space - bottom_space) * (top_lim - bottom_lim))
+        plt.tight_layout()
+        plt.show()
+
+    def _evaluate_trial(self) -> Tuple[str, float, float]:
         trial_optrsa_parameters = {}
         for keys, value in self.trial.parameters.items():
             parent_keys, _, current_key = keys.rpartition("/")
@@ -294,10 +369,10 @@ class RSACMAESOptHyperparametersOptimization:
         self.pickle()
         optrsa_optimization.run()
         # TODO Maybe deal with optrsa optimization errors
-        objective = optrsa_optimization.get_result()[1]
-        return objective
+        particle_attributes, objective, objective_stddev = optrsa_optimization.get_result()
+        return particle_attributes, objective, objective_stddev
 
-    def _resume_trial_evaluation(self) -> float:
+    def _resume_trial_evaluation(self) -> Tuple[str, float, float]:
         optrsa_opt_signature = str(os.listdir(self.trial_output_dir)[0])
         # Conversion to str is added because PyCharm assumes that os.listdir returns list of bytes, even though it
         # returns list of str
@@ -309,13 +384,15 @@ class RSACMAESOptHyperparametersOptimization:
         optrsa_opt_class = getattr(sys.modules["optrsa"], optrsa_opt_class_name)
         optrsa_optimization = optrsa_opt_class.unpickle(optrsa_opt_resume_signature)
         # TODO Maybe deal with optrsa optimization errors
-        objective = optrsa_optimization.get_result()[1]
-        return objective
+        particle_attributes, objective, objective_stddev = optrsa_optimization.get_result()
+        return particle_attributes, objective, objective_stddev
 
-    def _finalize_trial(self, objective: float) -> None:
+    def _finalize_trial(self, particle_attributes: str, objective: float, objective_stddev: float) -> None:
         # TODO Maybe add observations after each generation (iteration), maybe supply some context
         self.study.add_observation(trial=self.trial,
-                                   objective=objective)
+                                   objective=objective,
+                                   context={"Objective-Std-Dev": objective_stddev,
+                                            "Particle-Attributes": particle_attributes})
         self.study.finalize(trial=self.trial)
         self.study.save()
         self.pickle()
@@ -339,17 +416,19 @@ class RSACMAESOptHyperparametersOptimization:
             if self.trial_output_dir.exists():
                 pickled_optimizations = list(self.trial_output_dir.glob("*/_*.pkl"))
                 if len(pickled_optimizations) > 0:
-                    objective = self._resume_trial_evaluation()
+                    particle_attributes, objective, objective_stddev = self._resume_trial_evaluation()
                 else:
                     self.logger.warning(msg="Directory of trial number {} without optrsa pickle file found"
                                             " - this trial will be reevaluated".format(self.trial.id))
                     shutil.rmtree(self.trial_output_dir)
-                    objective = self._evaluate_trial()
+                    particle_attributes, objective, objective_stddev = self._evaluate_trial()
             else:
-                objective = self._evaluate_trial()
-            self._finalize_trial(objective)
+                particle_attributes, objective, objective_stddev = self._evaluate_trial()
+            self._finalize_trial(particle_attributes, objective, objective_stddev)
             self.logger.info(msg="End of trial number {}".format(self.trial.id))
             self.logger.info(msg="Objective: {}".format(objective))
+            self.logger.info(msg="Objective standard deviation: {}".format(objective_stddev))
+            self.logger.info(msg="Particle attributes: {}".format(particle_attributes))
             trial_end_time = datetime.datetime.now()
             self.logger.info("Trial time: {}".format(str(trial_end_time - trial_start_time)))
 
@@ -363,10 +442,12 @@ class RSACMAESOptHyperparametersOptimization:
             for parameter_name, parameter_value in self.trial.parameters.items():
                 self.logger.info(msg="{}: {}".format(parameter_name, parameter_value))
             self.trial_output_dir = Path(self.optrsa_output_dir) / "{:03d}".format(self.trial.id)
-            objective = self._evaluate_trial()
-            self._finalize_trial(objective)
+            particle_attributes, objective, objective_stddev = self._evaluate_trial()
+            self._finalize_trial(particle_attributes, objective, objective_stddev)
             self.logger.info(msg="End of trial number {}".format(self.trial.id))
             self.logger.info(msg="Objective: {}".format(objective))
+            self.logger.info(msg="Objective standard deviation: {}".format(objective_stddev))
+            self.logger.info(msg="Particle attributes: {}".format(particle_attributes))
             trial_end_time = datetime.datetime.now()
             self.logger.info("Trial time: {}".format(str(trial_end_time - trial_start_time)))
         self.logger.info(msg="")
@@ -401,7 +482,7 @@ def initialize_optimization(file: str, optimization_link: str) -> None:
     optimization_input = load_optimization_input(file)
     optimization = RSACMAESOptHyperparametersOptimization.create_optimization(optimization_input)
     optimization.pickle()
-    print("Optimization signature: {}".format(optimization.signature), file=optimization.stdout)
+    print("Optimization signature: {}".format(optimization.signature), file=optimization.stdout, flush=True)
     with open(_input_dir + "/" + optimization_link, "w+") as opt_signature_file:
         opt_signature_file.write(optimization.signature)
 
@@ -419,43 +500,44 @@ def resume_optimization(signature: str, file: Optional[str] = None) -> None:
     if file is not None:
         with open(_input_dir + "/" + file, "r") as opt_input_file:
             resume_input = yaml.load(opt_input_file)
-        if "parameters" in resume_input:
-            # Parameters are updated since the next trial, not the resumed one
+        if resume_input is not None:
+            if "parameters" in resume_input:
+                # Parameters are updated since the next trial, not the resumed one
 
-            def set_resume_parameters(parameters_dict: dict, parent_keys: str = "") -> None:
-                for key, value in parameters_dict.items():
-                    # This solution assumes that parameter keys do not contain "/" characters
-                    key_str = str(key)
-                    if "/" in key_str:
-                        raise ValueError("Parameter name: {} contains forbidden \"/\" character".format(key_str))
-                    keys = parent_keys + "/" + key_str
-                    if isinstance(value, dict):
-                        set_resume_parameters(value, keys)
-                    elif isinstance(value, HyperparameterConfiguration):
-                        optimization.logger.warning(msg="Updating or setting new hyperparameters while resuming"
-                                                        " optimization is not possible."
-                                                        " {} parameter is ignored.".format(keys[1:]))
-                    else:
-                        if not any(optimized_parameter.name == keys[1:] for optimized_parameter
-                                   in optimization.optimized_parameters):
-                            nested_fixed_parameters_dict = optimization.create_parent_parameter_keys(
-                                parent_keys[1:], optimization.fixed_parameters)
-                            nested_fixed_parameters_dict[key] = value
-                        else:
-                            optimization.logger.warning(msg="Updating optimized parameters while resuming optimization"
-                                                            " is not possible."
+                def set_resume_parameters(parameters_dict: dict, parent_keys: str = "") -> None:
+                    for key, value in parameters_dict.items():
+                        # This solution assumes that parameter keys do not contain "/" characters
+                        key_str = str(key)
+                        if "/" in key_str:
+                            raise ValueError("Parameter name: {} contains forbidden \"/\" character".format(key_str))
+                        keys = parent_keys + "/" + key_str
+                        if isinstance(value, dict):
+                            set_resume_parameters(value, keys)
+                        elif isinstance(value, HyperparameterConfiguration):
+                            optimization.logger.warning(msg="Updating or setting new hyperparameters while resuming"
+                                                            " optimization is not possible."
                                                             " {} parameter is ignored.".format(keys[1:]))
-                if len(parameters_dict) == 0:
-                    optimization.create_parent_parameter_keys(parent_keys[1:], optimization.fixed_parameters)
+                        else:
+                            if not any(optimized_parameter.name == keys[1:] for optimized_parameter
+                                       in optimization.optimized_parameters):
+                                nested_fixed_parameters_dict = optimization.create_parent_parameter_keys(
+                                    parent_keys[1:], optimization.fixed_parameters)
+                                nested_fixed_parameters_dict[key] = value
+                            else:
+                                optimization.logger.warning(msg="Updating optimized parameters while resuming"
+                                                                " optimization is not possible."
+                                                                " {} parameter is ignored.".format(keys[1:]))
+                    if len(parameters_dict) == 0:
+                        optimization.create_parent_parameter_keys(parent_keys[1:], optimization.fixed_parameters)
 
-            set_resume_parameters(resume_input["parameters"])
-        if "gpyopt_options" in resume_input:
-            for option_name, option_value in resume_input["gpyopt_options"].items():
-                setattr(optimization.study.algorithm, option_name, option_value)
-            # optimization.gpyopt_options is not updated
-        for attr in []:  # "nodes_number"
-            if attr in resume_input:
-                setattr(optimization, attr, resume_input[attr])
+                set_resume_parameters(resume_input["parameters"])
+            if "gpyopt_options" in resume_input:
+                for option_name, option_value in resume_input["gpyopt_options"].items():
+                    setattr(optimization.study.algorithm, option_name, option_value)
+                # optimization.gpyopt_options is not updated
+            for attr in []:  # "nodes_number"
+                if attr in resume_input:
+                    setattr(optimization, attr, resume_input[attr])
         # Generate used optimization input file in output directory
         resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds").replace(":", "-") \
             .replace(".", "_")
@@ -466,6 +548,17 @@ def resume_optimization(signature: str, file: Optional[str] = None) -> None:
         optimization.logger.info(msg="Optimization resume input file: {}-input.yaml".format(resume_signature))
     # Run optimization
     optimization.run()
+
+
+# TODO Maybe do it in another way
+@mod_arg_parser.argument("-c", "--config",
+                         help="name of graph configuration YAML file from optimization directory")
+@mod_arg_parser.command("plotoptdata", parsers=["opt_signature"])
+def plot_optimization_data(signature: str, config: Optional[str] = None) -> None:
+    """Plot optrsa hyperparameters optimization data"""
+    config_file_name = config if config is not None else "graph_config.yaml"
+    RSACMAESOptHyperparametersOptimization.plot_optimization_data(signature=signature,
+                                                                  config_file_name=config_file_name)
 
 
 # TODO Maybe add feature of plotting optimization data

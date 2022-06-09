@@ -1,0 +1,35 @@
+#!/bin/bash
+JOB_COMMAND=$(scontrol show job $SLURM_JOB_ID | grep Command)
+# JOB_COMMAND_ARR=(${JOB_COMMAND/=/ })
+# SCRIPT_DIR=$(dirname ${JOB_COMMAND_ARR[1]})
+SCRIPT_DIR=$(dirname ${JOB_COMMAND#*=})
+OPTIMIZATION_LINK=$SLURM_JOB_NAME.sig
+RESUMPTION_INPUT=$SLURM_JOB_NAME-resumption-input.yaml
+
+cd $SCRIPT_DIR
+echo
+if [ ! -f $OPTIMIZATION_LINK ]; then
+    echo "Optimization initialization"
+else
+    echo "Optimization resumption"
+fi
+echo "Job name: $SLURM_JOB_NAME"
+echo "Job ID: $SLURM_JOB_ID"
+if [ -n "$SLURM_RESTART_COUNT" ]; then
+    echo "Job restarts count: $SLURM_RESTART_COUNT"  # This variable is not set if the job was not restarted
+fi
+echo "Nodes number: $SLURM_JOB_NUM_NODES"
+echo -n "Timestamp: "
+date
+source $OPTRSA_DIR/$OPTRSA_VENV/bin/activate
+if [ -z $PYTHONPATH ]; then
+    export PYTHONPATH=$OPTRSA_DIR
+else
+    export PYTHONPATH=$OPTRSA_DIR:$PYTHONPATH
+fi
+if [ ! -f $OPTIMIZATION_LINK ]; then
+    srun python -m mpi4py.futures -m $OPTRSA_MODULE initializeopt $OPTIMIZATION_INPUT $OPTIMIZATION_LINK
+    touch $RESUMPTION_INPUT
+else
+    srun python -m mpi4py.futures -m $OPTRSA_MODULE resumeoptimization $(cat $OPTIMIZATION_LINK) -f $RESUMPTION_INPUT
+fi

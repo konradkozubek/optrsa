@@ -1239,8 +1239,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         :param candidate_num: Identification number of the candidate
         :param simulation_num: Identification number of the simulation
         :param first_collector_num: Identification number of the first collector
-        :param rsa_proc_arguments: rsa3d process' arguments, which are updated with from, collectors and appendToDat
-                                   parameters
+        :param rsa_proc_arguments: rsa3d process' arguments, which are updated with from and collectors parameters
         :param task_submitting_time: datetime.datetime object representing the time of submitting the partial simulation
                                      task to the pool of workers in run_simulations_on_okeanos method. Used in a logging
                                      purpose.
@@ -1282,8 +1281,8 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                                                         ", " + node_message[:-2]))
             # Prepare RSA process arguments
             rsa_proc_arguments = rsa_proc_arguments[:]  # Maybe it is not needed
-            rsa_proc_arguments.extend(["-from=" + str(first_collector_num), "-collectors=" + str(collectors_num),
-                                       "-appendToDat=true"])
+            rsa_proc_arguments.extend(["-from=" + str(first_collector_num), "-collectors=" + str(collectors_num)])
+            # appendToDat parameter is not added by "-appendToDat=true", because appending is now a default operation
             # Create a file for saving the output of rsa3d program
             simulation_output_dir = self.rsa_output_dir + "/{:03d}_{:02d}_{:04d}".format(self.CMAES.countiter,
                                                                                          candidate_num,
@@ -2586,7 +2585,7 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
         sys.stdout = self.stdout
         sys.stderr = self.stderr
 
-    def get_result(self) -> Tuple[str, float]:
+    def get_result(self) -> Tuple[str, float, float]:
         """Method returning tuple with particle attributes and packing fraction of the best particle in optimization"""
         opt_data_filename = self.output_dir + "/optimization.dat"
         # Prepare optimization data file if it does not exist
@@ -2600,7 +2599,9 @@ class RSACMAESOptimization(metaclass=abc.ABCMeta):
                                               dtype=self.optimization_data_columns)
         best_generation_num: int = optimization_data["bestpfrac"].idxmax()
         best_generation_data: pd.Series = optimization_data.loc[best_generation_num]
-        return best_generation_data["bestpartattrs"], best_generation_data["bestpfrac"]
+        return best_generation_data["bestpartattrs"], \
+               best_generation_data["bestpfrac"], \
+               best_generation_data["bestpfracstddev"]
 
 
 class PolydiskRSACMAESOpt(RSACMAESOptimization, metaclass=abc.ABCMeta):
@@ -4023,7 +4024,8 @@ def resume_optimization(signature: str, file: Optional[str] = None) -> None:
     optimization.logger.info(msg="")
     optimization.logger.info(msg="")
     optimization.logger.info(msg="Resuming optimization")
-    interrupted_simulations_dirs = glob.glob(optimization.rsa_output_dir + "/{}_*".format(optimization.CMAES.countiter))
+    interrupted_simulations_dirs = glob.glob(optimization.rsa_output_dir
+                                             + "/{:03d}_*".format(optimization.CMAES.countiter))
     if len(interrupted_simulations_dirs) > 0:
         optimization.logger.info(msg="Moving interrupted generation simulations' directories {} to the unused"
                                      " simulations folder".format(", ".join(map(os.path.basename,
@@ -4044,63 +4046,65 @@ def resume_optimization(signature: str, file: Optional[str] = None) -> None:
     optimization.set_optimization_class_attributes(optimization_input=optimization.optimization_input)
     # Overwrite optimization options, if the file argument was given
     if file is not None:
-        with open(_input_dir + "/" + file, "r") as opt_input_file:
-            resume_input = yaml.load(opt_input_file)
-        # TODO Test it
-        if "cma_options" in resume_input:
-            # After unpickling output is redirected to logger, so CMAEvolutionStrategy classes' errors and warnings
-            # as e.g. "UserWarning: key popsize ignored (not recognized as versatile) ..." will be logged
-            optimization.CMAES.opts.set(resume_input["cma_options"])
-            # optimization.cma_options is not updated
-        if "rsa_parameters" in resume_input:
-            for param in list(optimization.mode_rsa_parameters) + ["particleAttributes"]:
-                if param in resume_input["rsa_parameters"]:
-                    del resume_input["rsa_parameters"][param]
-                    optimization.logger.warning(msg="Resume RSA parameter {} ignored".format(param))
-            optimization.rsa_parameters.update(resume_input["rsa_parameters"])
-            if not optimization.input_given:
-                optimization.all_rsa_parameters.update(resume_input["rsa_parameters"])
-        for attr in ["accuracy", "parallel", "particle_attributes_parallel", "okeanos", "max_nodes_number",
-                     "okeanos_parallel", "nodes_number", "collectors_per_task"]:
-            if attr in resume_input:
-                setattr(optimization, attr, resume_input[attr])
-        if "min_collectors_number" in resume_input:
-            optimization.min_collectors_number = max(resume_input["min_collectors_number"], 2)
-        if "threads" in resume_input:
-            optimization.parallel_threads_number = resume_input["threads"]
-        if any(attr in resume_input for attr in ["threads", "okeanos", "max_nodes_number"]):
-            if not optimization.okeanos:
-                optimization.parallel_simulations_number = min(optimization.parallel_threads_number,
-                                                               optimization.CMAES.popsize)
-            else:
-                optimization.parallel_simulations_number = min(optimization.max_nodes_number - 1,
-                                                               optimization.CMAES.popsize) \
-                    if optimization.max_nodes_number is not None else optimization.CMAES.popsize
-        # TODO Set (and maybe check) other attributes, if needed
-        if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) \
-                or "accuracy" in resume_input or "okeanos_parallel" in resume_input:
-            # All attributes that are used in optimization.rsa_proc_arguments have to be set already, if present
-            optimization.set_rsa_proc_arguments()
-        # Generate used optimization input file in output directory
         resume_signature = datetime.datetime.now().isoformat(timespec="milliseconds").replace(":", "-") \
             .replace(".", "_")
         resume_signature += "-optimization-resume-gen-{}".format(optimization.CMAES.countiter)
+        with open(_input_dir + "/" + file, "r") as opt_input_file:
+            resume_input = yaml.load(opt_input_file)
+        if resume_input is not None:
+            # TODO Test it
+            if "cma_options" in resume_input:
+                # After unpickling output is redirected to logger, so CMAEvolutionStrategy classes' errors and warnings
+                # as e.g. "UserWarning: key popsize ignored (not recognized as versatile) ..." will be logged
+                optimization.CMAES.opts.set(resume_input["cma_options"])
+                # optimization.cma_options is not updated
+            if "rsa_parameters" in resume_input:
+                for param in list(optimization.mode_rsa_parameters) + ["particleAttributes"]:
+                    if param in resume_input["rsa_parameters"]:
+                        del resume_input["rsa_parameters"][param]
+                        optimization.logger.warning(msg="Resume RSA parameter {} ignored".format(param))
+                optimization.rsa_parameters.update(resume_input["rsa_parameters"])
+                if not optimization.input_given:
+                    optimization.all_rsa_parameters.update(resume_input["rsa_parameters"])
+            for attr in ["accuracy", "parallel", "particle_attributes_parallel", "okeanos", "max_nodes_number",
+                         "okeanos_parallel", "nodes_number", "collectors_per_task"]:
+                if attr in resume_input:
+                    setattr(optimization, attr, resume_input[attr])
+            if "min_collectors_number" in resume_input:
+                optimization.min_collectors_number = max(resume_input["min_collectors_number"], 2)
+            if "threads" in resume_input:
+                optimization.parallel_threads_number = resume_input["threads"]
+            if any(attr in resume_input for attr in ["threads", "okeanos", "max_nodes_number"]):
+                if not optimization.okeanos:
+                    optimization.parallel_simulations_number = min(optimization.parallel_threads_number,
+                                                                   optimization.CMAES.popsize)
+                else:
+                    optimization.parallel_simulations_number = min(optimization.max_nodes_number - 1,
+                                                                   optimization.CMAES.popsize) \
+                        if optimization.max_nodes_number is not None else optimization.CMAES.popsize
+            # TODO Set (and maybe check) other attributes, if needed
+            if ("rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0) \
+                    or "accuracy" in resume_input or "okeanos_parallel" in resume_input:
+                # All attributes that are used in optimization.rsa_proc_arguments have to be set already, if present
+                optimization.set_rsa_proc_arguments()
+            if "rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0:
+                rsa_input_filename = optimization.output_dir + "/" + resume_signature + "-rsa-input.txt"
+                with open(rsa_input_filename, "w+") as rsa_input_file:
+                    # TODO Maybe use resume_input["rsa_parameters"] instead
+                    rsa_parameters = optimization.rsa_parameters if optimization.input_given \
+                        else optimization.all_rsa_parameters
+                    rsa_input_file.writelines(["{} = {}\n".format(param_name, param_value)
+                                               for param_name, param_value in rsa_parameters.items()])
+                optimization.logger.info(msg="Resume RSA input file: {}-rsa-input.txt".format(resume_signature))
+        # Generate used optimization input file in output directory
         opt_input_filename = optimization.output_dir + "/" + resume_signature + "-input.yaml"
         with open(opt_input_filename, "w+") as opt_input_file:
             yaml.dump(resume_input, opt_input_file)
         optimization.logger.info(msg="Optimization resume input file: {}-input.yaml".format(resume_signature))
-        if "rsa_parameters" in resume_input and len(resume_input["rsa_parameters"]) > 0:
-            rsa_input_filename = optimization.output_dir + "/" + resume_signature + "-rsa-input.txt"
-            with open(rsa_input_filename, "w+") as rsa_input_file:
-                # TODO Maybe use resume_input["rsa_parameters"] instead
-                rsa_parameters = optimization.rsa_parameters if optimization.input_given \
-                    else optimization.all_rsa_parameters
-                rsa_input_file.writelines(["{} = {}\n".format(param_name, param_value)
-                                           for param_name, param_value in rsa_parameters.items()])
-            optimization.logger.info(msg="Resume RSA input file: {}-rsa-input.txt".format(resume_signature))
     # If optimization is to be run on Okeanos in parallel mode, try to set nodes_number attribute to the number of nodes
     # actually allocated to the SLURM job, unless nodes_number was given in resume input file
-    if optimization.okeanos_parallel and (file is None or "nodes_number" not in resume_input):
+    if optimization.okeanos_parallel and (file is None or (resume_input is not None
+                                                           and "nodes_number" not in resume_input)):
         slurm_job_num_nodes = os.getenv("SLURM_JOB_NUM_NODES")
         if slurm_job_num_nodes is not None:
             optimization.nodes_number = int(slurm_job_num_nodes)

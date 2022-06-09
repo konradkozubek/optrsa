@@ -1,0 +1,2 @@
+optrsa_dir: /absolute/path/to/optrsa/directory
+optrsa_venv: optrsa-py-3-X-Y-Z-venv

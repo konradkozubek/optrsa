@@ -1,0 +1,9 @@
+ntasks_per_node: 1
+cpus_per_task: 48
+account: GXY-ABCD
+partition: okeanos
+dependency: singleton
+requeue:
+open_mode: append
+mail_user: user@domain.xyz
+mail_type: ALL
