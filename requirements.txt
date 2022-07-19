@@ -52,7 +52,7 @@ Shapely==1.8.1.post1
 six==1.13.0
 threadpoolctl==3.1.0
 typing-extensions==3.7.4.2
-urllib3==1.25.8
+urllib3==1.26.5
 wcwidth==0.2.5
 Werkzeug==2.0.3
 wolframclient==1.1.2
